@@ -3,17 +3,17 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { evaluate, validate, ext, globMatch, compileGlob, Policy, Candidate, Action } from "./policy";
 
-// THE contract with internal/policy in Go. Both suites read this file and must
-// agree on every case. If they diverge, the plugin will show the user a preview
-// that does not match what the worker actually did.
+// THE contract with internal/policy in Go. Both suites read the one file at the
+// repo root and must agree on every case. If they diverge, the plugin will show
+// the user a preview that does not match what the worker actually did.
 //
-// Resolved relative to THIS FILE, not to the working directory: the old
-// "../schema/..." was relative to cwd and pointed outside the repo, so the
-// suite collected zero tests and the contract was not actually being checked.
-const goldenPath = fileURLToPath(new URL("../schema/policy-golden.json", import.meta.url));
+// Resolved relative to THIS FILE, not to the working directory, so the suite
+// cannot quietly collect zero cases when run from somewhere else.
+const goldenPath = fileURLToPath(new URL("../../schema/policy-golden.json", import.meta.url));
 const golden = JSON.parse(readFileSync(goldenPath, "utf8")) as {
   policy: Policy;
   cases: { _why?: string; candidate: Candidate; want: Action; want_rule: string }[];
+  invalid: { _why: string; policy: unknown }[];
 };
 
 describe("policy golden fixture", () => {
@@ -23,6 +23,7 @@ describe("policy golden fixture", () => {
 
   it("is not empty", () => {
     expect(golden.cases.length).toBeGreaterThan(0);
+    expect(golden.invalid.length).toBeGreaterThan(0);
   });
 
   for (const [i, c] of golden.cases.entries()) {
@@ -31,6 +32,13 @@ describe("policy golden fixture", () => {
       expect(d.action).toBe(c.want);
       expect(d.rule).toBe(c.want_rule);
       expect(d.reason).not.toBe("");
+    });
+  }
+
+  // Go's policy.Parse rejects every one of these too.
+  for (const [i, c] of golden.invalid.entries()) {
+    it(`rejects invalid ${i}: ${c._why}`, () => {
+      expect(validate(c.policy as Policy)).not.toBeNull();
     });
   }
 });

@@ -4,8 +4,9 @@
 // (irreversible). This decides what enters THIS VAULT (reversible, per-device).
 // Different defaults, different consequences, same rule schema.
 //
-// Both implementations are tested against schema/policy-golden.json. If you
-// change one, change the fixture, and run both suites.
+// Both implementations are tested against the repo root's
+// schema/policy-golden.json, one file shared with the Go suite. If you change
+// one engine, change the fixture, and run both suites.
 
 export type Action = "include" | "skip";
 
@@ -22,12 +23,15 @@ export interface Rule {
   priority: number;
   match: Match;
   action: Action;
+  /** Free text for humans, as in deploy/rules.json. Ignored by the engine. */
+  _comment?: string;
 }
 
 export interface Policy {
   version: number;
   default: Action;
   rules: Rule[];
+  _comment?: string;
 }
 
 export interface Candidate {
@@ -43,35 +47,78 @@ export interface Decision {
   reason: string;
 }
 
+const POLICY_KEYS: ReadonlySet<string> = new Set(["version", "default", "rules", "_comment"]);
+const RULE_KEYS: ReadonlySet<string> = new Set(["name", "priority", "match", "action", "_comment"]);
+const MATCH_KEYS: ReadonlySet<string> = new Set(["ext", "glob", "min_size", "max_size", "course_ids"]);
+
+type Obj = Record<string, unknown>;
+
+const isObj = (v: unknown): v is Obj => typeof v === "object" && v !== null && !Array.isArray(v);
+const extraKey = (o: Obj, allowed: ReadonlySet<string>) => Object.keys(o).find((k) => !allowed.has(k));
+const optional = (v: unknown, ok: (v: unknown) => boolean) => v === undefined || v === null || ok(v);
+const isStringList = (v: unknown) => Array.isArray(v) && v.every((s) => typeof s === "string");
+const isIntList = (v: unknown) => Array.isArray(v) && v.every((n) => Number.isInteger(n));
+
+/**
+ * Behavioural twin of policy.Parse in Go, which decodes strictly.
+ *
+ * The value arrives from a user-edited JSON textarea, so the declared type is a
+ * claim, not a guarantee: every shape is checked the way Go's decoder would.
+ * Unknown fields are rejected because a typo like "max_szie" would otherwise
+ * be dropped silently, leaving a rule far broader than the one written. The
+ * `invalid` section of the shared golden fixture holds both sides to this.
+ */
 export function validate(p: Policy): string | null {
-  if (p.version !== 1) return `unsupported policy version ${p.version}`;
-  // Widened to string on purpose: this value arrives from a user-edited JSON
-  // textarea, so the declared type is a claim, not a guarantee.
-  const dflt: string = p.default;
-  if (dflt !== "include" && dflt !== "skip") return `bad default ${dflt}`;
-  if (!Array.isArray(p.rules)) return "rules must be an array";
+  const raw: unknown = p;
+  if (!isObj(raw)) return "policy must be a JSON object";
+  const extra = extraKey(raw, POLICY_KEYS);
+  if (extra !== undefined) return `unknown field ${extra}`;
+  if (raw.version !== 1) return `unsupported policy version ${String(raw.version)}`;
+  if (raw.default !== "include" && raw.default !== "skip") return `bad default ${String(raw.default)}`;
+  if (!Array.isArray(raw.rules)) return "rules must be an array";
 
   const seen = new Set<string>();
-  for (const r of p.rules) {
-    if (!r.name) return "a rule has no name";
-    if (seen.has(r.name)) return `duplicate rule name ${r.name}`;
-    seen.add(r.name);
-    const action: string = r.action;
-    if (action !== "include" && action !== "skip") {
-      return `rule ${r.name} has bad action ${action}`;
-    }
-    if (typeof r.priority !== "number" || !Number.isFinite(r.priority)) {
-      return `rule ${r.name} has a non-numeric priority`;
-    }
-    if (!r.match || typeof r.match !== "object") return `rule ${r.name} has no match`;
-    if (isEmptyMatch(r.match)) {
-      return `rule ${r.name} matches everything, which is what default is for`;
-    }
-    // Go's path.Match returns ErrBadPattern for these; catching it here means
-    // the user finds out while editing rules, not silently at preview time.
-    for (const g of r.match.glob ?? []) {
-      if (compileGlob(g) === null) return `rule ${r.name} has an invalid glob pattern ${g}`;
-    }
+  for (const r of raw.rules as unknown[]) {
+    const err = validateRule(r, seen);
+    if (err !== null) return err;
+  }
+  return null;
+}
+
+function validateRule(r: unknown, seen: Set<string>): string | null {
+  if (!isObj(r)) return "a rule is not an object";
+  const name = typeof r.name === "string" ? r.name : "";
+  if (!name) return "a rule has no name";
+  const extra = extraKey(r, RULE_KEYS);
+  if (extra !== undefined) return `rule ${name} has unknown field ${extra}`;
+  if (seen.has(name)) return `duplicate rule name ${name}`;
+  seen.add(name);
+  if (r.action !== "include" && r.action !== "skip") {
+    return `rule ${name} has bad action ${String(r.action)}`;
+  }
+  // Go decodes priority into an int, which refuses 1.5.
+  if (typeof r.priority !== "number" || !Number.isInteger(r.priority)) {
+    return `rule ${name} has a non-integer priority`;
+  }
+
+  const m = r.match;
+  if (!isObj(m)) return `rule ${name} has no match`;
+  const mextra = extraKey(m, MATCH_KEYS);
+  if (mextra !== undefined) return `rule ${name} has unknown match field ${mextra}`;
+  if (!optional(m.ext, isStringList)) return `rule ${name}: ext must be a list of strings`;
+  if (!optional(m.glob, isStringList)) return `rule ${name}: glob must be a list of strings`;
+  if (!optional(m.min_size, Number.isInteger)) return `rule ${name}: min_size must be a whole number of bytes`;
+  if (!optional(m.max_size, Number.isInteger)) return `rule ${name}: max_size must be a whole number of bytes`;
+  if (!optional(m.course_ids, isIntList)) return `rule ${name}: course_ids must be a list of numbers`;
+
+  const match = m as Match;
+  if (isEmptyMatch(match)) {
+    return `rule ${name} matches everything, which is what default is for`;
+  }
+  // Go's path.Match returns ErrBadPattern for these; catching it here means
+  // the user finds out while editing rules, not silently at preview time.
+  for (const g of match.glob ?? []) {
+    if (compileGlob(g) === null) return `rule ${name} has an invalid glob pattern ${g}`;
   }
   return null;
 }

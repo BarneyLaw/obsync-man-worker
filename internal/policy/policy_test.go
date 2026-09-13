@@ -178,32 +178,51 @@ func TestDeployedWorkerRulesParse(t *testing.T) {
 
 // The golden file is the contract with plugin/src/policy.ts. Both sides load
 // the SAME file, schema/policy-golden.json, and must produce identical
-// decisions. If you change the engine, change the golden file, and run both
-// test suites. A missing fixture is a failure, not a skip.
+// decisions and reject the same invalid policies. If you change the engine,
+// change the golden file, and run both test suites. A missing fixture is a
+// failure, not a skip.
 func TestGoldenFixture(t *testing.T) {
 	raw, err := os.ReadFile(filepath.Join("..", "..", "schema", "policy-golden.json"))
 	if err != nil {
 		t.Fatalf("golden fixture missing: %v", err)
 	}
 	var g struct {
-		Policy Policy `json:"policy"`
+		Policy json.RawMessage `json:"policy"`
 		Cases  []struct {
+			Why       string    `json:"_why"`
 			Candidate Candidate `json:"candidate"`
 			Want      Action    `json:"want"`
 			WantRule  string    `json:"want_rule"`
 		} `json:"cases"`
+		Invalid []struct {
+			Why    string          `json:"_why"`
+			Policy json.RawMessage `json:"policy"`
+		} `json:"invalid"`
 	}
 	if err := json.Unmarshal(raw, &g); err != nil {
 		t.Fatal(err)
 	}
-	if err := g.Policy.Validate(); err != nil {
+	// Strict parse, the same path deploy/rules.json takes.
+	p, err := Parse(g.Policy)
+	if err != nil {
 		t.Fatal(err)
 	}
+	if len(g.Cases) == 0 || len(g.Invalid) == 0 {
+		t.Fatal("golden fixture must have both cases and invalid policies")
+	}
 	for i, c := range g.Cases {
-		d := g.Policy.Evaluate(c.Candidate)
+		d := p.Evaluate(c.Candidate)
 		if d.Action != c.Want || d.Rule != c.WantRule {
-			t.Errorf("case %d (%s): got %s/%s want %s/%s",
-				i, c.Candidate.Path, d.Action, d.Rule, c.Want, c.WantRule)
+			t.Errorf("case %d (%s, %s): got %s/%s want %s/%s",
+				i, c.Candidate.Path, c.Why, d.Action, d.Rule, c.Want, c.WantRule)
+		}
+		if d.Reason == "" {
+			t.Errorf("case %d (%s): empty reason", i, c.Candidate.Path)
+		}
+	}
+	for i, c := range g.Invalid {
+		if _, err := Parse(c.Policy); err == nil {
+			t.Errorf("invalid policy %d accepted: %s", i, c.Why)
 		}
 	}
 }
