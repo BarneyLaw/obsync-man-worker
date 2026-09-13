@@ -35,5 +35,12 @@ fixtures:
 contract:
 	go test -count=1 ./internal/manifest ./internal/policy
 	cd plugin && npx vitest run src/contract.test.ts src/preview.test.ts src/policy.test.ts
+# Local Garage for the S3 backend: eval "$(scripts/garage-dev.sh env)" afterwards.
+garage-up:
+	scripts/garage-dev.sh up
+garage-down:
+	scripts/garage-dev.sh down
+s3-test:
+	OBSYNC_REQUIRE_S3=1 go test -count=1 -v -run S3 ./internal/store ./internal/run
 # Everything both CI workflows run.
 ci: lint test plugin-lint plugin-test plugin
