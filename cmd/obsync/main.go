@@ -360,6 +360,7 @@ func cmdGC(ctx context.Context, st store.Store, log *slog.Logger, args []string)
 func cmdServe(ctx context.Context, fsStore *store.FS, log *slog.Logger, args []string) error {
 	fs := flag.NewFlagSet("obsync serve", flag.ContinueOnError)
 	addr := fs.String("addr", "127.0.0.1:8765", "listen address")
+	bucket := fs.String("bucket", "obsync", "also serve keys under /<bucket>/, as the plugin's Bucket setting requests them; empty to disable")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -370,7 +371,11 @@ func cmdServe(ctx context.Context, fsStore *store.FS, log *slog.Logger, args []s
 			"risk", "the store is served without authentication to anything that can reach this address")
 	}
 
-	srv := &http.Server{Addr: *addr, Handler: &storeHandler{fs: fsStore, log: log}, ReadHeaderTimeout: 10 * time.Second}
+	srv := &http.Server{
+		Addr:              *addr,
+		Handler:           &storeHandler{fs: fsStore, log: log, bucket: *bucket},
+		ReadHeaderTimeout: 10 * time.Second,
+	}
 	go func() {
 		<-ctx.Done()
 		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -378,8 +383,9 @@ func cmdServe(ctx context.Context, fsStore *store.FS, log *slog.Logger, args []s
 		srv.Shutdown(sctx)
 	}()
 	root, _ := filepath.Abs(fsStore.Root)
-	log.Info("serve.start", "addr", *addr, "root", root)
-	fmt.Fprintf(os.Stderr, "serving %s read-only at http://%s  (plugin base URL)\n", root, *addr)
+	log.Info("serve.start", "addr", *addr, "root", root, "bucket", *bucket)
+	fmt.Fprintf(os.Stderr, "serving %s read-only\n  plugin Store URL: http://%s\n  plugin Bucket:    %q (or empty)\n",
+		root, *addr, *bucket)
 	if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
@@ -388,11 +394,13 @@ func cmdServe(ctx context.Context, fsStore *store.FS, log *slog.Logger, args []s
 }
 
 // storeHandler exposes exactly the keys a consumer reads, the same shape the
-// plugin expects from Garage behind an auth proxy: GET {base}/{key} with Range.
-// Read-only, no directory listings, nothing outside manifests/ and blobs/.
+// plugin expects from Garage behind an auth proxy: GET {base}/{key}, or
+// GET {base}/{bucket}/{key} when the plugin's Bucket setting is filled in, with
+// Range. Read-only, no directory listings, nothing outside manifests/ and blobs/.
 type storeHandler struct {
-	fs  *store.FS
-	log *slog.Logger
+	fs     *store.FS
+	log    *slog.Logger
+	bucket string
 }
 
 func (h *storeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -410,6 +418,9 @@ func (h *storeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	key := strings.TrimPrefix(r.URL.Path, "/")
+	if h.bucket != "" {
+		key = strings.TrimPrefix(key, h.bucket+"/")
+	}
 	if !strings.HasPrefix(key, "manifests/") && !strings.HasPrefix(key, "blobs/") {
 		http.NotFound(rec, r)
 		return
