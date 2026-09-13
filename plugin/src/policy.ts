@@ -45,14 +45,32 @@ export interface Decision {
 
 export function validate(p: Policy): string | null {
   if (p.version !== 1) return `unsupported policy version ${p.version}`;
-  if (p.default !== "include" && p.default !== "skip") return `bad default ${p.default}`;
+  // Widened to string on purpose: this value arrives from a user-edited JSON
+  // textarea, so the declared type is a claim, not a guarantee.
+  const dflt: string = p.default;
+  if (dflt !== "include" && dflt !== "skip") return `bad default ${dflt}`;
+  if (!Array.isArray(p.rules)) return "rules must be an array";
+
   const seen = new Set<string>();
   for (const r of p.rules) {
     if (!r.name) return "a rule has no name";
     if (seen.has(r.name)) return `duplicate rule name ${r.name}`;
     seen.add(r.name);
+    const action: string = r.action;
+    if (action !== "include" && action !== "skip") {
+      return `rule ${r.name} has bad action ${action}`;
+    }
+    if (typeof r.priority !== "number" || !Number.isFinite(r.priority)) {
+      return `rule ${r.name} has a non-numeric priority`;
+    }
+    if (!r.match || typeof r.match !== "object") return `rule ${r.name} has no match`;
     if (isEmptyMatch(r.match)) {
       return `rule ${r.name} matches everything, which is what default is for`;
+    }
+    // Go's path.Match returns ErrBadPattern for these; catching it here means
+    // the user finds out while editing rules, not silently at preview time.
+    for (const g of r.match.glob ?? []) {
+      if (compileGlob(g) === null) return `rule ${r.name} has an invalid glob pattern ${g}`;
     }
   }
   return null;
@@ -109,16 +127,118 @@ export function ext(p: string): string {
 }
 
 /**
- * Go's path.Match semantics, not full globbing: `*` does not cross `/`.
- * Matching Go exactly here is the whole point, since the golden fixture is
- * shared.
+ * Go's path.Match semantics, not full globbing. Matching Go exactly here is the
+ * whole point, since the golden fixture is shared with internal/policy.
+ *
+ * Supported, per Go's grammar:
+ *   *          any run of non-separator characters
+ *   ?          one non-separator character
+ *   [abc]      character class; [^abc] negates (Go uses ^, not !)
+ *   [a-z]      range
+ *   \x         literal x
+ *
+ * A malformed pattern (unterminated class, empty class, reversed range,
+ * trailing backslash) is Go's ErrBadPattern and matches nothing. validate()
+ * surfaces those to the user rather than letting a rule quietly never fire.
  */
 export function globMatch(pattern: string, name: string): boolean {
-  const rx = pattern
-    .replace(/[.+^${}()|[\]\\]/g, "\\$&")
-    .replace(/\*/g, "[^/]*")
-    .replace(/\?/g, "[^/]");
-  return new RegExp(`^${rx}$`).test(name);
+  const rx = compileGlob(pattern);
+  return rx !== null && rx.test(name);
+}
+
+const globCache = new Map<string, RegExp | null>();
+
+/** @returns null for a pattern Go would reject with ErrBadPattern. */
+export function compileGlob(pattern: string): RegExp | null {
+  const hit = globCache.get(pattern);
+  if (hit !== undefined) return hit;
+  const rx = buildGlob(pattern);
+  globCache.set(pattern, rx);
+  return rx;
+}
+
+function buildGlob(pattern: string): RegExp | null {
+  let out = "";
+  let i = 0;
+  while (i < pattern.length) {
+    const c = pattern[i]!;
+    if (c === "*") {
+      // The one rule that makes this path matching rather than string matching.
+      out += "[^/]*";
+      i++;
+    } else if (c === "?") {
+      out += "[^/]";
+      i++;
+    } else if (c === "\\") {
+      if (i + 1 >= pattern.length) return null; // trailing backslash
+      out += escLiteral(pattern[i + 1]!);
+      i += 2;
+    } else if (c === "[") {
+      const cls = buildClass(pattern, i);
+      if (cls === null) return null;
+      out += cls.src;
+      i = cls.next;
+    } else {
+      out += escLiteral(c);
+      i++;
+    }
+  }
+  try {
+    return new RegExp(`^${out}$`, "u");
+  } catch {
+    return null;
+  }
+}
+
+function buildClass(p: string, start: number): { src: string; next: number } | null {
+  let i = start + 1;
+  let neg = false;
+  if (p[i] === "^") {
+    neg = true;
+    i++;
+  }
+  let body = "";
+  let count = 0;
+  while (i < p.length && p[i] !== "]") {
+    const lo = readClassChar(p, i);
+    if (lo === null) return null;
+    i = lo.next;
+    if (p[i] === "-" && i + 1 < p.length && p[i + 1] !== "]") {
+      const hi = readClassChar(p, i + 1);
+      if (hi === null) return null;
+      if (hi.ch < lo.ch) return null; // Go rejects a reversed range
+      body += `${escClass(lo.ch)}-${escClass(hi.ch)}`;
+      i = hi.next;
+    } else {
+      body += escClass(lo.ch);
+    }
+    count++;
+  }
+  if (i >= p.length) return null; // unterminated
+  if (count === 0) return null;   // Go requires a non-empty class
+  return { src: `[${neg ? "^" : ""}${body}]`, next: i + 1 };
+}
+
+function readClassChar(p: string, i: number): { ch: string; next: number } | null {
+  if (i >= p.length) return null;
+  if (p[i] === "\\") {
+    if (i + 1 >= p.length) return null;
+    return { ch: p[i + 1]!, next: i + 2 };
+  }
+  return { ch: p[i]!, next: i + 1 };
+}
+
+// The `u` flag only permits escaping actual syntax characters, so escape
+// exactly those and leave everything else alone.
+const SYNTAX = new Set(["^", "$", "\\", ".", "*", "+", "?", "(", ")", "[", "]", "{", "}", "|", "/"]);
+const CLASS_SYNTAX = new Set(["\\", "]", "^", "-"]);
+
+function escLiteral(ch: string): string {
+  return SYNTAX.has(ch) ? `\\${ch}` : ch;
+}
+
+function escClass(ch: string): string {
+  return CLASS_SYNTAX.has(ch) ? `\\${ch}` : ch;
 }
 
 export function humanBytes(n: number): string {

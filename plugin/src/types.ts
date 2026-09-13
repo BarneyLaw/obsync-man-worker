@@ -56,9 +56,17 @@ export const manifestKey = (courseId: number, runId: string) =>
  */
 export function parseManifest(raw: string): Manifest {
   const m = JSON.parse(raw) as Manifest;
-  if (m.schema_version !== SCHEMA_VERSION) {
+  if (typeof m.schema_version !== "number") {
+    throw new Error("obsync: manifest has no schema_version");
+  }
+  if (m.schema_version > SCHEMA_VERSION) {
     throw new Error(
       `obsync: manifest schema v${m.schema_version} is newer than this plugin understands (v${SCHEMA_VERSION}). Update the plugin.`,
+    );
+  }
+  if (m.schema_version < SCHEMA_VERSION) {
+    throw new Error(
+      `obsync: manifest schema v${m.schema_version} is older than this plugin supports (v${SCHEMA_VERSION}). Re-run the worker.`,
     );
   }
   if (!Array.isArray(m.entries)) throw new Error("obsync: manifest has no entries");

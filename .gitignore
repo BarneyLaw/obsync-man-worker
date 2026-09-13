@@ -50,14 +50,18 @@ go.work.sum
 obsync-download-*
 
 # Plugin: dependencies, build output, and settings Obsidian writes into the
-# plugin folder when it is symlinked into a vault
+# plugin folder when it is symlinked into a vault. Released builds go to
+# GitHub releases, never into git.
 plugin/node_modules/
 plugin/main.js
+plugin/**/*.map
 plugin/data.json
+plugin/.parts/
 plugin/coverage/
 
 # Editors and OS
 .vscode/
 .idea/
+*.iml
 .DS_Store
 Thumbs.db

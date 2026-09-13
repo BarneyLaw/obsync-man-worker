@@ -1,0 +1,110 @@
+{
+  "_comment": [
+    "THE contract between internal/policy (Go) and src/policy.ts (TypeScript).",
+    "Both test suites decode this file and must agree on every case. If they",
+    "diverge, the plugin shows the user a preview that does not match what the",
+    "worker actually did.",
+    "",
+    "This copy lives in the plugin repo because the worker repo is not vendored",
+    "here. When the two are brought under one roof, make this the single copy",
+    "and have both suites read it; do not fork it."
+  ],
+  "policy": {
+    "version": 1,
+    "default": "include",
+    "rules": [
+      { "name": "no-tiny", "priority": 5, "action": "skip", "match": { "max_size": 10 } },
+      { "name": "no-huge", "priority": 10, "action": "skip", "match": { "min_size": 52428800 } },
+      { "name": "no-video", "priority": 20, "action": "skip", "match": { "ext": ["mp4", "mov", "mkv"] } },
+      { "name": "drafts", "priority": 25, "action": "skip", "match": { "glob": ["draft[0-9].pdf"] } },
+      { "name": "solutions", "priority": 30, "action": "skip", "match": { "glob": ["*/solutions/*"] } },
+      {
+        "name": "always-slides",
+        "priority": 40,
+        "action": "include",
+        "match": { "ext": ["pdf"], "glob": ["*/lectures/*"] }
+      },
+      { "name": "other-course", "priority": 50, "action": "skip", "match": { "course_ids": [999] } }
+    ]
+  },
+  "cases": [
+    {
+      "_why": "nothing matches, so the default decides",
+      "candidate": { "Path": "notes.pdf", "Size": 1000, "CourseID": 1 },
+      "want": "include",
+      "want_rule": ""
+    },
+    {
+      "_why": "min_size is inclusive-at-or-above",
+      "candidate": { "Path": "big.pdf", "Size": 104857600, "CourseID": 1 },
+      "want": "skip",
+      "want_rule": "no-huge"
+    },
+    {
+      "_why": "max_size caps from below",
+      "candidate": { "Path": "stub.txt", "Size": 5, "CourseID": 1 },
+      "want": "skip",
+      "want_rule": "no-tiny"
+    },
+    {
+      "_why": "extension match",
+      "candidate": { "Path": "lecture.mp4", "Size": 1000, "CourseID": 1 },
+      "want": "skip",
+      "want_rule": "no-video"
+    },
+    {
+      "_why": "extension match is case-insensitive",
+      "candidate": { "Path": "LECTURE.MP4", "Size": 1000, "CourseID": 1 },
+      "want": "skip",
+      "want_rule": "no-video"
+    },
+    {
+      "_why": "glob star matches one path segment",
+      "candidate": { "Path": "cs/solutions/a.pdf", "Size": 1000, "CourseID": 1 },
+      "want": "skip",
+      "want_rule": "solutions"
+    },
+    {
+      "_why": "THE path-semantics case: star must not cross a separator",
+      "candidate": { "Path": "cs/x/solutions/a.pdf", "Size": 1000, "CourseID": 1 },
+      "want": "include",
+      "want_rule": ""
+    },
+    {
+      "_why": "character class, as in Go's path.Match",
+      "candidate": { "Path": "draft3.pdf", "Size": 1000, "CourseID": 1 },
+      "want": "skip",
+      "want_rule": "drafts"
+    },
+    {
+      "_why": "character class does not match outside its range",
+      "candidate": { "Path": "draftX.pdf", "Size": 1000, "CourseID": 1 },
+      "want": "include",
+      "want_rule": ""
+    },
+    {
+      "_why": "every clause of a match must hold: ext and glob together",
+      "candidate": { "Path": "cs/lectures/w1.pdf", "Size": 1000, "CourseID": 1 },
+      "want": "include",
+      "want_rule": "always-slides"
+    },
+    {
+      "_why": "higher priority beats a hard cap: an include can rescue a big file",
+      "candidate": { "Path": "cs/lectures/big.pdf", "Size": 104857600, "CourseID": 1 },
+      "want": "include",
+      "want_rule": "always-slides"
+    },
+    {
+      "_why": "course_ids scoping",
+      "candidate": { "Path": "notes.pdf", "Size": 1000, "CourseID": 999 },
+      "want": "skip",
+      "want_rule": "other-course"
+    },
+    {
+      "_why": "a file with no extension has no ext to match",
+      "candidate": { "Path": "README", "Size": 1000, "CourseID": 1 },
+      "want": "include",
+      "want_rule": ""
+    }
+  ]
+}
