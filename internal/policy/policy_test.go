@@ -105,28 +105,85 @@ func TestValidateRejectsDuplicateNames(t *testing.T) {
 	}
 }
 
-// Hash must ignore cosmetic reordering, or every rules edit forces a pointless
-// re-evaluation of every skipped entry in the store.
-func TestHashIsOrderInsensitive(t *testing.T) {
+// Priority ties break by document order, so swapping two equal-priority rules
+// can flip a decision. The hash must see that.
+func TestHashIsRuleOrderSensitive(t *testing.T) {
+	a := Policy{Version: 1, Default: ActionInclude, Rules: []Rule{
+		{Name: "first", Priority: 5, Action: ActionSkip, Match: Match{Ext: []string{"pdf"}}},
+		{Name: "second", Priority: 5, Action: ActionInclude, Match: Match{Ext: []string{"pdf"}}},
+	}}
+	b := a
+	b.Rules = []Rule{a.Rules[1], a.Rules[0]}
+	if a.Evaluate(Candidate{Path: "x.pdf"}).Action == b.Evaluate(Candidate{Path: "x.pdf"}).Action {
+		t.Fatal("test premise broken: reorder should change the decision")
+	}
+	if a.Hash() == b.Hash() {
+		t.Fatal("reorder changed behaviour but not the hash")
+	}
+}
+
+func TestHashIgnoresSetOrderAndComments(t *testing.T) {
 	a := testPolicy()
 	b := testPolicy()
-	b.Rules[0], b.Rules[2] = b.Rules[2], b.Rules[0]
+	b.Rules[0].Match.Ext = []string{"mov", "mp4", "mkv"}
+	b.Comment = "edited the comment"
+	b.Rules[1].Comment = "and this one"
 	if a.Hash() != b.Hash() {
-		t.Fatal("hash changed on reorder alone")
+		t.Fatal("hash changed on ext order or comments alone")
 	}
-	b.Rules[0].Priority += 1
+	b.Rules[0].Priority++
 	if a.Hash() == b.Hash() {
 		t.Fatal("hash did not change on a real edit")
 	}
 }
 
-// The golden file is the contract with plugin/src/policy.ts. Both sides load
-// it and must produce identical decisions. If you change the engine, change the
-// golden file, and run both test suites.
-func TestGoldenFixture(t *testing.T) {
-	raw, err := os.ReadFile(filepath.Join("testdata", "golden.json"))
+// Hash used to sort the caller's slices in place.
+func TestHashDoesNotMutatePolicy(t *testing.T) {
+	p := testPolicy()
+	p.Rules[0].Match.Ext = []string{"mp4", "avi", "mkv"}
+	p.Hash()
+	if p.Rules[0].Match.Ext[0] != "mp4" {
+		t.Fatalf("Hash reordered the caller's ext list: %v", p.Rules[0].Match.Ext)
+	}
+}
+
+func TestParseRejectsUnknownFields(t *testing.T) {
+	_, err := Parse([]byte(`{"version":1,"default":"include","rules":[
+		{"name":"cap","priority":1,"action":"skip","match":{"ext":["mp4"],"max_szie":10}}]}`))
+	if err == nil {
+		t.Fatal("a typo in a match key silently broadens the rule and must be rejected")
+	}
+}
+
+func TestParseAcceptsComments(t *testing.T) {
+	p, err := Parse([]byte(`{"_comment":"hi","version":1,"default":"include","rules":[
+		{"_comment":"why","name":"cap","priority":1,"action":"skip","match":{"ext":["mp4"]}}]}`))
 	if err != nil {
-		t.Skip("no golden fixture yet")
+		t.Fatal(err)
+	}
+	if len(p.Rules) != 1 {
+		t.Fatalf("rules = %+v", p.Rules)
+	}
+}
+
+func TestDeployedWorkerRulesParse(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "deploy", "rules.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Parse(raw); err != nil {
+		t.Fatalf("deploy/rules.json does not parse: %v", err)
+	}
+}
+
+// The golden file is the contract with plugin/src/policy.ts. Both sides load
+// the SAME file, schema/policy-golden.json, and must produce identical
+// decisions. If you change the engine, change the golden file, and run both
+// test suites. A missing fixture is a failure, not a skip.
+func TestGoldenFixture(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "schema", "policy-golden.json"))
+	if err != nil {
+		t.Fatalf("golden fixture missing: %v", err)
 	}
 	var g struct {
 		Policy Policy `json:"policy"`

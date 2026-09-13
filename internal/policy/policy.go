@@ -6,12 +6,13 @@
 // can be as aggressive as the user likes).
 //
 // The TypeScript implementation in plugin/src/policy.ts must stay behaviourally
-// identical. Both sides test against testdata/rules-golden.yaml.
+// identical. Both sides test against schema/policy-golden.json.
 //
 // Pure: no I/O, no clock.
 package policy
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -46,12 +47,32 @@ type Rule struct {
 	Priority int    `json:"priority" yaml:"priority"`
 	Match    Match  `json:"match" yaml:"match"`
 	Action   Action `json:"action" yaml:"action"`
+	// Comment is free text for humans. Excluded from Hash.
+	Comment string `json:"_comment,omitempty" yaml:"_comment,omitempty"`
 }
 
 type Policy struct {
 	Version int    `json:"version" yaml:"version"`
 	Default Action `json:"default" yaml:"default"`
 	Rules   []Rule `json:"rules" yaml:"rules"`
+	// Comment is free text for humans. Excluded from Hash.
+	Comment string `json:"_comment,omitempty" yaml:"_comment,omitempty"`
+}
+
+// Parse decodes and validates a rules file. Unknown fields are an error: a
+// typo like "max_szie" would otherwise be silently dropped, leaving a rule far
+// broader than the one you wrote.
+func Parse(b []byte) (*Policy, error) {
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.DisallowUnknownFields()
+	var p Policy
+	if err := dec.Decode(&p); err != nil {
+		return nil, fmt.Errorf("policy: parse: %w", err)
+	}
+	if err := p.Validate(); err != nil {
+		return nil, err
+	}
+	return &p, nil
 }
 
 // Candidate is the subset of a Canvas file a rule can see. Deliberately narrow:
@@ -135,18 +156,26 @@ func (p *Policy) Evaluate(c Candidate) Decision {
 	}
 }
 
-// Hash identifies a rule set. When it changes, previously skipped entries must
-// be re-evaluated, since last run's decisions no longer reflect current rules.
+// Hash identifies a rule set. It is recorded on every manifest so a run can be
+// traced back to the rules that produced it.
 //
-// Canonicalised through JSON with sorted rules so cosmetic reordering or
-// whitespace does not force a full re-evaluation.
+// Rules stay in document order: priority ties break by document order, so
+// reordering rules can change decisions and must change the hash. The lists
+// inside a match are sets, so those are sorted, on copies, never in place:
+// sorting the caller's slices would be a data race once courses run
+// concurrently. Comments are excluded.
 func (p *Policy) Hash() string {
-	c := *p
-	c.Rules = append([]Rule(nil), p.Rules...)
-	sort.Slice(c.Rules, func(i, j int) bool { return c.Rules[i].Name < c.Rules[j].Name })
-	for i := range c.Rules {
-		sort.Strings(c.Rules[i].Match.Ext)
-		sort.Strings(c.Rules[i].Match.Glob)
+	c := Policy{Version: p.Version, Default: p.Default, Rules: make([]Rule, len(p.Rules))}
+	for i, r := range p.Rules {
+		r.Comment = ""
+		r.Match.Ext = sortedStrings(r.Match.Ext)
+		r.Match.Glob = sortedStrings(r.Match.Glob)
+		if len(r.Match.CourseIDs) > 0 {
+			ids := append([]int64(nil), r.Match.CourseIDs...)
+			sort.Slice(ids, func(a, b int) bool { return ids[a] < ids[b] })
+			r.Match.CourseIDs = ids
+		}
+		c.Rules[i] = r
 	}
 	b, err := json.Marshal(c)
 	if err != nil {
@@ -221,6 +250,15 @@ func containsFold(hay []string, needle string) bool {
 		}
 	}
 	return false
+}
+
+func sortedStrings(s []string) []string {
+	if len(s) == 0 {
+		return nil
+	}
+	out := append([]string(nil), s...)
+	sort.Strings(out)
+	return out
 }
 
 func containsInt64(hay []int64, n int64) bool {
