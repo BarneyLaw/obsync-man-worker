@@ -60,7 +60,7 @@ func main() {
 
 	r := &run.Runner{
 		Source: src, Store: st, Policy: pol, Log: log,
-		Now: time.Now, DownloadConcurrency: 8,
+		Now: time.Now,
 	}
 
 	runID := time.Now().UTC().Format("20060102T150405Z")
@@ -76,7 +76,7 @@ func main() {
 
 	failed := false
 	for _, c := range courses {
-		s, err := r.Course(ctx, c, runID)
+		s, err := r.Course(ctx, c, run.Options{RunID: runID})
 		if err != nil {
 			// One bad course must not abort the others. Its previous manifest
 			// stays live, which is the correct degraded state.
