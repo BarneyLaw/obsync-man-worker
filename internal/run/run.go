@@ -93,7 +93,7 @@ func (r *Runner) Course(ctx context.Context, c canvas.Course, runID string) (Sta
 	// TODO(step 2): bound this with a semaphore of DownloadConcurrency and run
 	// it in an errgroup. Sequential is correct, just slow, so ship it first.
 	for _, f := range p.Fetch {
-		e, n, err := r.fetch(ctx, byPath[f.Path], f)
+		e, n, err := r.fetch(ctx, byPath[f.Path], f.File)
 		if err != nil {
 			r.Log.Warn("fetch failed", "path", f.Path, "err", err)
 			e = manifest.Entry{

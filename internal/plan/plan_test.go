@@ -1,11 +1,13 @@
 package plan
 
 import (
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/leifsen/obsync/internal/manifest"
 	"github.com/leifsen/obsync/internal/policy"
+	"github.com/leifsen/obsync/internal/scope"
 )
 
 var (
@@ -196,5 +198,191 @@ func TestCollidingPathsAreDisambiguatedDeterministically(t *testing.T) {
 		if !pb[k] {
 			t.Fatalf("path set depends on listing order: %v vs %v", pa, pb)
 		}
+	}
+}
+
+func sizeCapRules() *policy.Policy {
+	return &policy.Policy{Version: 1, Default: policy.ActionInclude, Rules: []policy.Rule{
+		{Name: "cap", Priority: 10, Action: policy.ActionSkip, Match: policy.Match{MinSize: 1000}},
+	}}
+}
+
+// The old differ carried a skip forward whenever the rules hash was unchanged,
+// so a file re-uploaded under the size cap stayed skipped forever.
+func TestSkippedFileIsReevaluatedWhenItShrinks(t *testing.T) {
+	r := sizeCapRules()
+	prev := prevManifest(r.Hash(), manifest.Entry{
+		Path: "data.zip", State: manifest.StateSkipped, CanvasID: 1, Size: 5000,
+		UpdatedAt: t0, ModifiedAt: t0, RuleName: "cap", Reason: "too big",
+	})
+	p := Compute(Input{Prev: prev, Files: []File{file("data.zip", 1, 50, now)}, Policy: r, Now: now})
+	if len(p.Fetch) != 1 {
+		t.Fatalf("shrunken file must be fetched: %+v", p)
+	}
+	if p.Fetch[0].Why != "previously skipped, now included" {
+		t.Fatalf("why = %q", p.Fetch[0].Why)
+	}
+}
+
+// course_ids rules never matched in the worker because CourseID was not passed.
+func TestCourseScopedRuleApplies(t *testing.T) {
+	r := &policy.Policy{Version: 1, Default: policy.ActionInclude, Rules: []policy.Rule{
+		{Name: "only-101", Priority: 1, Action: policy.ActionSkip,
+			Match: policy.Match{Ext: []string{"pdf"}, CourseIDs: []int64{101}}},
+	}}
+	in := Input{CourseID: 101, Files: []File{file("a.pdf", 1, 10, t0)}, Policy: r, Now: now}
+	if p := Compute(in); len(p.Skipped) != 1 {
+		t.Fatalf("rule scoped to course 101 did not apply in course 101: %+v", p)
+	}
+	in.CourseID = 202
+	if p := Compute(in); len(p.Fetch) != 1 {
+		t.Fatalf("rule scoped to course 101 applied in course 202: %+v", p)
+	}
+}
+
+// "Slides.pdf" and "slides.pdf" are one file on Windows and macOS.
+func TestCaseOnlyCollisionIsDisambiguated(t *testing.T) {
+	p := Compute(Input{
+		Files:  []File{file("Week 1/Slides.pdf", 1, 10, t0), file("week 1/slides.pdf", 2, 10, t0)},
+		Policy: rules(), Now: now,
+	})
+	if len(p.Fetch) != 2 {
+		t.Fatalf("fetch = %+v", p.Fetch)
+	}
+	a, b := p.Fetch[0].Path, p.Fetch[1].Path
+	if strings.EqualFold(a, b) {
+		t.Fatalf("case-only collision survived: %q vs %q", a, b)
+	}
+}
+
+// A suffixed path must not land on a real file of the same name.
+func TestDisambiguationAvoidsSecondaryCollision(t *testing.T) {
+	p := Compute(Input{
+		Files: []File{
+			file("a.pdf", 5, 10, t0),
+			file("a.pdf", 7, 10, t0),
+			file("a (5).pdf", 9, 10, t0),
+		},
+		Policy: rules(), Now: now,
+	})
+	seen := map[string]bool{}
+	for _, f := range p.Fetch {
+		k := strings.ToLower(f.Path)
+		if seen[k] {
+			t.Fatalf("duplicate path %q in %+v", f.Path, p.Fetch)
+		}
+		seen[k] = true
+	}
+}
+
+// Pagination over a changing collection can return the same file twice.
+func TestDuplicateCanvasIDIsDeduped(t *testing.T) {
+	p := Compute(Input{
+		Files:  []File{file("a.pdf", 1, 10, t0), file("a.pdf", 1, 10, now)},
+		Policy: rules(), Now: now,
+	})
+	if len(p.Fetch) != 1 || len(p.Duplicates) != 1 {
+		t.Fatalf("fetch=%+v dups=%v", p.Fetch, p.Duplicates)
+	}
+	if !p.Fetch[0].UpdatedAt.Equal(now) {
+		t.Fatal("dedupe must keep the most recently updated copy")
+	}
+}
+
+func TestFetchRecordsWhyAndPrev(t *testing.T) {
+	r := rules()
+	prev := prevManifest(r.Hash(), stored("a.pdf", 1, 100, t0))
+	p := Compute(Input{Prev: prev, Files: []File{file("a.pdf", 1, 120, t0)}, Policy: r, Now: now})
+	if len(p.Fetch) != 1 {
+		t.Fatalf("fetch = %+v", p.Fetch)
+	}
+	f := p.Fetch[0]
+	if f.Prev == nil || f.Prev.SHA256 != "deadbeef" {
+		t.Fatal("fetch must carry the previous entry so a failed download can fall back to it")
+	}
+	if !strings.Contains(f.Why, "size 100 -> 120") {
+		t.Fatalf("why = %q", f.Why)
+	}
+}
+
+func mustScope(t *testing.T, patterns ...string) scope.Scope {
+	t.Helper()
+	s, err := scope.Parse(patterns)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+func TestScopeFetchesOnlySelected(t *testing.T) {
+	p := Compute(Input{
+		Files:  []File{file("Week 1/a.pdf", 1, 10, t0), file("Week 2/b.pdf", 2, 10, t0)},
+		Policy: rules(), Scope: mustScope(t, "Week 1"), Now: now,
+	})
+	if len(p.Fetch) != 1 || p.Fetch[0].Path != "Week 1/a.pdf" {
+		t.Fatalf("fetch = %+v", p.Fetch)
+	}
+	if len(p.OutOfScope) != 1 {
+		t.Fatalf("out of scope = %+v", p.OutOfScope)
+	}
+	e := p.OutOfScope[0]
+	if e.State != manifest.StateSkipped || e.RuleName != ScopeRule || e.Reason == "" {
+		t.Fatalf("a never-fetched out-of-scope file must be catalogued as a scope skip: %+v", e)
+	}
+}
+
+// A scoped pull must never make a file the consumer already has disappear,
+// even when Canvas has a newer version of it.
+func TestScopeKeepsPreviousVersionOutsideScope(t *testing.T) {
+	r := rules()
+	prev := prevManifest(r.Hash(), stored("Week 2/b.pdf", 2, 10, t0))
+	p := Compute(Input{
+		Prev: prev, Files: []File{file("Week 2/b.pdf", 2, 99, now)},
+		Policy: r, Scope: mustScope(t, "Week 1"), Now: now,
+	})
+	if len(p.Fetch) != 0 || len(p.OutOfScope) != 1 {
+		t.Fatalf("plan = %+v", p)
+	}
+	kept := p.OutOfScope[0]
+	if kept.State != manifest.StateStored || kept.SHA256 != "deadbeef" || kept.Size != 10 {
+		t.Fatalf("previous entry must be kept verbatim so the next full pull still sees the change: %+v", kept)
+	}
+}
+
+// Scope limits downloads, not the catalogue: skips and tombstones stay complete.
+func TestScopeDoesNotHideSkipsOrTombstones(t *testing.T) {
+	r := rules()
+	prev := prevManifest(r.Hash(), stored("Week 2/gone.pdf", 3, 10, t0))
+	p := Compute(Input{
+		Prev: prev, Files: []File{file("Week 2/v.mp4", 4, 10, t0)},
+		Policy: r, Scope: mustScope(t, "Week 1"), Now: now,
+	})
+	if len(p.Skipped) != 1 || p.Skipped[0].RuleName != "no-video" {
+		t.Fatalf("skipped = %+v", p.Skipped)
+	}
+	if len(p.Tombstone) != 1 {
+		t.Fatalf("tombstone = %+v", p.Tombstone)
+	}
+}
+
+func TestScopeDeferredFileIsFetchedByNextFullPull(t *testing.T) {
+	r := rules()
+	prev := prevManifest(r.Hash(), manifest.Entry{
+		Path: "Week 2/b.pdf", State: manifest.StateSkipped, CanvasID: 2, Size: 10,
+		UpdatedAt: t0, ModifiedAt: t0, RuleName: ScopeRule, Reason: "deferred",
+	})
+	p := Compute(Input{Prev: prev, Files: []File{file("Week 2/b.pdf", 2, 10, t0)}, Policy: r, Now: now})
+	if len(p.Fetch) != 1 || p.Fetch[0].Why != "deferred by an earlier scoped pull" {
+		t.Fatalf("plan = %+v", p)
+	}
+}
+
+func TestPlanPathsExcludesTombstones(t *testing.T) {
+	r := rules()
+	prev := prevManifest(r.Hash(), stored("gone.pdf", 1, 10, t0))
+	p := Compute(Input{Prev: prev, Files: []File{file("a.pdf", 2, 10, t0)}, Policy: r, Now: now})
+	got := p.Paths()
+	if len(got) != 1 || got[0] != "a.pdf" {
+		t.Fatalf("paths = %v", got)
 	}
 }
