@@ -202,10 +202,3 @@ The contract path list is identical in both files; change them together. Each
 runs on pushes to `main`, on pull requests, and manually. Because of the path
 filters, a workflow that does not apply to a PR never reports, so do not make
 either one a blanket required check.
-
-## Before you start
-
-Confirm NUS has not disabled manual access token generation in Canvas user
-settings. If it has, phase 1 has no data source. (Verified working on
-2026-09-13.) Some courses hide the Files tab from students; `courses -probe`
-shows which, and scheduled runs record them as `forbidden` rather than failing.
