@@ -33,9 +33,17 @@ func read(t *testing.T, s Store, key string) string {
 }
 
 func TestConformance(t *testing.T) {
-	ctx := context.Background()
 	for name, s := range backends(t) {
-		t.Run(name, func(t *testing.T) {
+		t.Run(name, func(t *testing.T) { conformance(t, s) })
+	}
+}
+
+// conformance is the behaviour every backend promises. The S3 integration
+// test runs it against a real Garage.
+func conformance(t *testing.T, s Store) {
+	ctx := context.Background()
+	{
+		{
 			if _, err := s.Get(ctx, "missing/key"); !errors.Is(err, ErrNotFound) {
 				t.Fatalf("Get missing = %v, want ErrNotFound", err)
 			}
@@ -99,8 +107,35 @@ func TestConformance(t *testing.T) {
 				if string(b) != "3456" {
 					t.Fatalf("GetRange = %q", b)
 				}
+				for _, c := range []struct {
+					off, n int64
+					want   string
+				}{{8, 10, "89"}, {10, 5, ""}, {0, 10, "0123456789"}} {
+					rc, err := rr.GetRange(ctx, "r", c.off, c.n)
+					if err != nil {
+						t.Fatalf("GetRange(%d,%d): %v", c.off, c.n, err)
+					}
+					b, _ := io.ReadAll(rc)
+					rc.Close()
+					if string(b) != c.want {
+						t.Fatalf("GetRange(%d,%d) = %q want %q", c.off, c.n, b, c.want)
+					}
+				}
 			}
-		})
+
+			if st, ok := s.(Stater); ok {
+				info, err := st.Stat(ctx, "a/unknown")
+				if err != nil || info.Size != 3 || info.Modified.IsZero() {
+					t.Fatalf("Stat = %+v, %v", info, err)
+				}
+				if _, err := st.Stat(ctx, "a/missing"); !errors.Is(err, ErrNotFound) {
+					t.Fatalf("Stat missing = %v, want ErrNotFound", err)
+				}
+				if _, err := st.Stat(ctx, "a"); !errors.Is(err, ErrNotFound) {
+					t.Fatalf("Stat of a prefix = %v, want ErrNotFound", err)
+				}
+			}
+		}
 	}
 }
 

@@ -51,6 +51,13 @@ type Presigner interface {
 	Presign(ctx context.Context, key string, ttl time.Duration) (string, error)
 }
 
+// Stater is optional: an object's size and modification time without reading
+// it. `obsync serve` needs it to answer Range and conditional requests.
+// Returns ErrNotFound for a missing key.
+type Stater interface {
+	Stat(ctx context.Context, key string) (ObjectInfo, error)
+}
+
 // ExclusivePutter is optional: create key only if it does not exist, as one
 // atomic operation, returning ErrExists otherwise. It is what makes write-once
 // keys and the worker lease safe against a second writer.

@@ -104,6 +104,16 @@ func (m *Memory) Exists(_ context.Context, key string) (bool, error) {
 	return ok, nil
 }
 
+func (m *Memory) Stat(_ context.Context, key string) (ObjectInfo, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	b, ok := m.data[key]
+	if !ok {
+		return ObjectInfo{}, ErrNotFound
+	}
+	return ObjectInfo{Key: key, Size: int64(len(b)), Modified: m.modified[key]}, nil
+}
+
 func (m *Memory) Delete(_ context.Context, key string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
