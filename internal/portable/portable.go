@@ -9,23 +9,28 @@ import (
 	"fmt"
 	"strings"
 	"unicode"
+	"unicode/utf8"
+
+	"golang.org/x/text/unicode/norm"
 )
 
 const (
 	MaxComponent = 120
 	MaxTotal     = 400
+
+	// maxExt bounds what counts as an extension worth preserving on
+	// truncation. "lecture.pdf" has one; "notes.from the tutor about week 3"
+	// does not.
+	maxExt = 16
 )
 
 // Normalize is applied to every component before sanitisation.
 //
 // macOS hands you NFD, Windows and Linux hand you NFC, and iOS is inconsistent.
 // Without normalisation the same file becomes two different paths depending on
-// which device the worker happened to run on.
-//
-// TODO: wire this to golang.org/x/text/unicode/norm.NFC.String once you are
-// happy taking the dependency. Left as a variable so tests can swap it and so
-// the core package stays dependency-free.
-var Normalize = func(s string) string { return s }
+// which device the worker happened to run on. Left as a variable so tests can
+// swap it.
+var Normalize = norm.NFC.String
 
 // reserved holds Windows device names. Illegal as a whole component with or
 // without an extension: "CON", "con.txt" and "CON.PDF" all collide.
@@ -72,7 +77,7 @@ func Component(s string) (string, error) {
 		out = "_" + out
 	}
 	if len(out) > MaxComponent {
-		out = strings.TrimRight(truncateBytes(out, MaxComponent), ". ")
+		out = truncateKeepExt(out, MaxComponent)
 		if out == "" {
 			return "", fmt.Errorf("portable: component %q empty after truncation", s)
 		}
@@ -116,14 +121,47 @@ func Path(p string) (string, error) {
 //
 // Two distinct Canvas files can sanitise to the same path. Resolving that by
 // iteration order would make the manifest unstable across runs, so the suffix
-// has to come from the file itself.
-func Disambiguate(path string, canvasID int64) string {
-	slash := strings.LastIndex(path, "/")
-	dot := strings.LastIndex(path, ".")
-	if dot > slash+1 {
-		return fmt.Sprintf("%s (%d)%s", path[:dot], canvasID, path[dot:])
+// has to come from the file itself. The stem is shortened if the suffix would
+// push the final component past MaxComponent.
+func Disambiguate(p string, canvasID int64) string {
+	dir, name := "", p
+	if i := strings.LastIndex(p, "/"); i >= 0 {
+		dir, name = p[:i+1], p[i+1:]
 	}
-	return fmt.Sprintf("%s (%d)", path, canvasID)
+	suffix := fmt.Sprintf(" (%d)", canvasID)
+	stemPart, ext := name, ""
+	if i := strings.LastIndex(name, "."); i > 0 {
+		stemPart, ext = name[:i], name[i:]
+	}
+	if over := len(stemPart) + len(suffix) + len(ext) - MaxComponent; over > 0 {
+		keep := len(stemPart) - over
+		if keep < 0 {
+			keep = 0
+		}
+		stemPart = strings.TrimRight(truncateBytes(stemPart, keep), ". ")
+	}
+	return dir + stemPart + suffix + ext
+}
+
+// CollisionKey is the identity two paths share if they would land on the same
+// file on a case-insensitive filesystem (Windows, default macOS). Vaults live
+// on those, so "Slides.pdf" and "slides.pdf" are a collision even though the
+// strings differ.
+func CollisionKey(p string) string {
+	return strings.ToLower(Normalize(p))
+}
+
+// Fallback is a portable stand-in name for a Canvas file whose real name
+// cannot be made portable at all. The extension is kept when it survives
+// sanitisation so the file still opens and extension rules still apply.
+func Fallback(original string, canvasID int64) string {
+	name := fmt.Sprintf("canvas-file-%d", canvasID)
+	if i := strings.LastIndex(original, "."); i > 0 && len(original)-i-1 <= maxExt {
+		if ext, err := Component(original[i+1:]); err == nil && !strings.ContainsAny(ext, " .") {
+			return name + "." + ext
+		}
+	}
+	return name
 }
 
 func stem(s string) string {
@@ -133,13 +171,31 @@ func stem(s string) string {
 	return s
 }
 
+// truncateKeepExt shortens s to at most n bytes. A short extension is
+// preserved: cutting ".pdf" off would stop extension rules matching and stop
+// the OS knowing how to open the file.
+func truncateKeepExt(s string, n int) string {
+	stemPart, ext := s, ""
+	if i := strings.LastIndex(s, "."); i > 0 && len(s)-i-1 <= maxExt {
+		stemPart, ext = s[:i], s[i:]
+	}
+	if len(ext) >= n {
+		return strings.TrimRight(truncateBytes(s, n), ". ")
+	}
+	stemPart = strings.TrimRight(truncateBytes(stemPart, n-len(ext)), ". ")
+	if stemPart == "" {
+		return ""
+	}
+	return stemPart + ext
+}
+
+// truncateBytes cuts s to at most n bytes without splitting a UTF-8 sequence.
 func truncateBytes(s string, n int) string {
 	if len(s) <= n {
 		return s
 	}
-	r := []rune(s)
-	for len(r) > 0 && len(string(r)) > n {
-		r = r[:len(r)-1]
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
 	}
-	return string(r)
+	return s[:n]
 }

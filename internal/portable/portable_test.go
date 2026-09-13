@@ -3,6 +3,7 @@ package portable
 import (
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestComponent(t *testing.T) {
@@ -117,5 +118,78 @@ func TestDisambiguateIsDeterministic(t *testing.T) {
 	b := Disambiguate("x/y.pdf", 100)
 	if a != b {
 		t.Fatalf("not deterministic: %q vs %q", a, b)
+	}
+}
+
+func TestDisambiguateRespectsComponentCap(t *testing.T) {
+	long := strings.Repeat("s", MaxComponent-4) + ".pdf"
+	got := Disambiguate("dir/"+long, 123456789)
+	last := got[strings.LastIndex(got, "/")+1:]
+	if len(last) > MaxComponent {
+		t.Fatalf("component %d bytes exceeds %d", len(last), MaxComponent)
+	}
+	if !strings.HasSuffix(got, " (123456789).pdf") {
+		t.Fatalf("suffix or extension lost: %q", got)
+	}
+}
+
+// macOS hands out NFD. Without NFC the same lecture is two paths.
+func TestComponentNormalizesToNFC(t *testing.T) {
+	nfd := "Résumé.pdf"
+	nfc := "Résumé.pdf"
+	got, err := Component(nfd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != nfc {
+		t.Fatalf("got %q want NFC %q", got, nfc)
+	}
+}
+
+// Cutting ".pdf" off stops extension rules matching and stops the OS opening it.
+func TestTruncationKeepsExtension(t *testing.T) {
+	got, err := Component(strings.Repeat("a", 300) + ".pdf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasSuffix(got, ".pdf") || len(got) > MaxComponent {
+		t.Fatalf("got %q (%d bytes)", got, len(got))
+	}
+}
+
+func TestTruncationDoesNotSplitRunes(t *testing.T) {
+	got, err := Component(strings.Repeat("复", 100) + ".pdf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !utf8.ValidString(got) || len(got) > MaxComponent {
+		t.Fatalf("invalid truncation %q (%d bytes)", got, len(got))
+	}
+}
+
+func TestCollisionKeyFoldsCase(t *testing.T) {
+	if CollisionKey("Week 1/Slides.pdf") != CollisionKey("week 1/slides.PDF") {
+		t.Fatal("case-only differences must collide")
+	}
+}
+
+func TestFallback(t *testing.T) {
+	cases := []struct {
+		orig string
+		want string
+	}{
+		{"...", "canvas-file-7"},
+		{"???.pdf", "canvas-file-7.pdf"},
+		{"weird", "canvas-file-7"},
+		{"x.a very long not-an-extension", "canvas-file-7"},
+	}
+	for _, c := range cases {
+		got := Fallback(c.orig, 7)
+		if got != c.want {
+			t.Fatalf("Fallback(%q) = %q want %q", c.orig, got, c.want)
+		}
+		if _, err := Path(got); err != nil {
+			t.Fatalf("fallback %q is not itself portable: %v", got, err)
+		}
 	}
 }
