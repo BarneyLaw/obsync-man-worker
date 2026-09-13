@@ -163,6 +163,71 @@ func Encode(w io.Writer, m *Manifest) error {
 	return enc.Encode(m)
 }
 
+// Counts tallies entries by state, plus the bytes held in stored entries.
+func (m *Manifest) Counts() (map[State]int, int64) {
+	counts := map[State]int{}
+	var stored int64
+	for _, e := range m.Entries {
+		counts[e.State]++
+		if e.State == StateStored {
+			stored += e.Size
+		}
+	}
+	return counts, stored
+}
+
+type ChangeKind string
+
+const (
+	ChangeAdded   ChangeKind = "added"   // became live
+	ChangeRemoved ChangeKind = "removed" // stopped being live
+	ChangeContent ChangeKind = "content" // stored in both, different bytes
+	ChangeState   ChangeKind = "state"   // live in both, different state
+)
+
+type Change struct {
+	Path       string
+	Kind       ChangeKind
+	From, To   State
+	FromSHA256 string
+	ToSHA256   string
+}
+
+// Diff lists what changed between two manifests of the same course, sorted by
+// path. a may be nil, meaning everything live in b was added.
+func Diff(a, b *Manifest) []Change {
+	var before map[string]Entry
+	if a != nil {
+		before = a.ByPath()
+	}
+	after := b.ByPath()
+	live := func(e Entry, ok bool) bool { return ok && e.State != StateDeleted }
+
+	var out []Change
+	for p, eb := range after {
+		ea, okA := before[p]
+		switch {
+		case !live(ea, okA) && live(eb, true):
+			out = append(out, Change{Path: p, Kind: ChangeAdded, From: ea.State, To: eb.State, ToSHA256: eb.SHA256})
+		case live(ea, okA) && !live(eb, true):
+			out = append(out, Change{Path: p, Kind: ChangeRemoved, From: ea.State, To: eb.State, FromSHA256: ea.SHA256})
+		case live(ea, okA) && ea.State != eb.State:
+			out = append(out, Change{Path: p, Kind: ChangeState, From: ea.State, To: eb.State,
+				FromSHA256: ea.SHA256, ToSHA256: eb.SHA256})
+		case live(ea, okA) && eb.State == StateStored && ea.SHA256 != eb.SHA256:
+			out = append(out, Change{Path: p, Kind: ChangeContent, From: ea.State, To: eb.State,
+				FromSHA256: ea.SHA256, ToSHA256: eb.SHA256})
+		}
+	}
+	for p, ea := range before {
+		if _, ok := after[p]; !ok && ea.State != StateDeleted {
+			out = append(out, Change{Path: p, Kind: ChangeRemoved, From: ea.State, FromSHA256: ea.SHA256})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
+	return out
+}
+
 // Decode refuses unknown schema versions rather than ignoring fields it does
 // not understand. A consumer that silently drops fields will corrupt a vault
 // the first time the schema grows.
