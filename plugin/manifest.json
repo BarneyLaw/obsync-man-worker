@@ -1,0 +1,10 @@
+{
+  "id": "obsync",
+  "name": "obsync",
+  "version": "0.1.0",
+  "minAppVersion": "1.12.3",
+  "description": "Mirror Canvas LMS course files into your vault, read-only, with per-device exclusion rules.",
+  "author": "leifsen",
+  "authorUrl": "https://leifsen.dev",
+  "isDesktopOnly": false
+}

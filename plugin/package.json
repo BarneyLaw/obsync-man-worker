@@ -1,0 +1,27 @@
+{
+  "name": "obsync-plugin",
+  "version": "0.1.0",
+  "description": "Obsidian consumer for obsync",
+  "main": "main.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "version": "node version-bump.mjs && git add manifest.json versions.json"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@noble/hashes": "^1.5.0",
+    "aws4fetch": "^1.0.20"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "builtin-modules": "^4.0.0",
+    "esbuild": "^0.24.0",
+    "obsidian": "latest",
+    "tslib": "^2.7.0",
+    "typescript": "^5.9.3",
+    "vitest": "^2.1.9"
+  }
+}
