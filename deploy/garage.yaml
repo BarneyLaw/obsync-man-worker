@@ -1,0 +1,108 @@
+# Garage v2.3.x on K3s. Separate cluster from the nebula backup instance.
+#
+# Honest cost of that separation: two clusters to operate, two layouts, two sets
+# of secrets and upgrade cycles. The blast-radius argument justifies it, but it
+# is a real bill.
+#
+# Two deployment details that bite people:
+#  1. Metadata on local-path PVs pinned per node. NEVER on a replicated volume:
+#     Garage replicates at the application layer and replicating underneath is
+#     pure waste plus worse metadata latency.
+#  2. rpc_public_addr must be the stable pod DNS name. Set it to localhost and
+#     the nodes will never form a layout.
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: garage-config, namespace: obsync }
+data:
+  garage.toml: |
+    metadata_dir = "/var/lib/garage/meta"
+    data_dir     = "/var/lib/garage/data"
+    db_engine    = "lmdb"
+
+    replication_factor = 3
+
+    rpc_bind_addr = "[::]:3901"
+    # rpc_secret injected from the garage-secrets Secret via GARAGE_RPC_SECRET
+
+    [s3_api]
+    s3_region = "garage"
+    api_bind_addr = "[::]:3900"
+    root_domain = ".s3.garage.internal"
+
+    [s3_web]
+    bind_addr = "[::]:3902"
+    root_domain = ".web.garage.internal"
+    index = "index.html"
+
+    [admin]
+    api_bind_addr = "[::]:3903"
+---
+apiVersion: v1
+kind: Service
+metadata: { name: garage-rpc, namespace: obsync }
+spec:
+  clusterIP: None          # headless: stable per-pod DNS for RPC
+  selector: { app: garage }
+  ports: [{ name: rpc, port: 3901 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: garage, namespace: obsync }
+spec:
+  selector: { app: garage }
+  ports:
+    - { name: s3,    port: 3900 }
+    - { name: web,   port: 3902 }
+    - { name: admin, port: 3903 }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: { name: garage, namespace: obsync }
+spec:
+  serviceName: garage-rpc
+  replicas: 3
+  selector: { matchLabels: { app: garage } }
+  template:
+    metadata: { labels: { app: garage } }
+    spec:
+      # One Garage pod per node. Co-locating two defeats replication entirely.
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector: { matchLabels: { app: garage } }
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: garage
+          image: dxflrs/garage:v2.3.0
+          env:
+            - name: POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: GARAGE_RPC_SECRET
+              valueFrom: { secretKeyRef: { name: garage-secrets, key: rpc-secret } }
+            - name: GARAGE_ADMIN_TOKEN
+              valueFrom: { secretKeyRef: { name: garage-secrets, key: admin-token } }
+            - name: GARAGE_RPC_PUBLIC_ADDR
+              value: "$(POD_NAME).garage-rpc.obsync.svc.cluster.local:3901"
+          ports:
+            - { containerPort: 3900, name: s3 }
+            - { containerPort: 3901, name: rpc }
+            - { containerPort: 3902, name: web }
+            - { containerPort: 3903, name: admin }
+          volumeMounts:
+            - { name: config, mountPath: /etc/garage.toml, subPath: garage.toml }
+            - { name: meta,   mountPath: /var/lib/garage/meta }
+            - { name: data,   mountPath: /var/lib/garage/data }
+      volumes:
+        - name: config
+          configMap: { name: garage-config }
+  volumeClaimTemplates:
+    - metadata: { name: meta }
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: local-path
+        resources: { requests: { storage: 5Gi } }
+    - metadata: { name: data }
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: local-path
+        resources: { requests: { storage: 100Gi } }

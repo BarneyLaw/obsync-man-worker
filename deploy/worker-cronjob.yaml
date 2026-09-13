@@ -1,0 +1,51 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata: { name: obsync-worker, namespace: obsync }
+spec:
+  # Offset from the hour: everything else in the cluster fires on :00.
+  schedule: "17 */6 * * *"
+  # LOAD BEARING. The entire design assumes exactly one writer, because
+  # manifests/<course>/latest is a read-modify-write with no compare-and-swap.
+  # Two concurrent workers will clobber each other. Do not relax this.
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        metadata:
+          annotations:
+            # Forces a roll when rules change so Argo does not leave stale config.
+            checksum/rules: "REPLACED_BY_KUSTOMIZE"
+        spec:
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+          containers:
+            - name: worker
+              image: ghcr.io/leifsen/obsync-worker:latest
+              args: ["-rules=/etc/obsync/rules.json", "-pushgateway=http://pushgateway.monitoring:9091"]
+              env:
+                - name: CANVAS_BASE_URL
+                  value: "https://canvas.nus.edu.sg"
+                - name: CANVAS_TOKEN
+                  valueFrom: { secretKeyRef: { name: obsync-secrets, key: canvas-token } }
+                - name: GARAGE_ENDPOINT
+                  value: "http://garage.obsync.svc.cluster.local:3900"
+                - name: GARAGE_BUCKET
+                  value: "obsync"
+                - name: GARAGE_ACCESS_KEY
+                  valueFrom: { secretKeyRef: { name: obsync-secrets, key: garage-access-key } }
+                - name: GARAGE_SECRET_KEY
+                  valueFrom: { secretKeyRef: { name: obsync-secrets, key: garage-secret-key } }
+              volumeMounts:
+                - { name: rules, mountPath: /etc/obsync }
+              resources:
+                requests: { cpu: 100m, memory: 256Mi }
+                limits:   { memory: 1Gi }
+          volumes:
+            - name: rules
+              configMap: { name: obsync-rules }

@@ -1,0 +1,19 @@
+# The only alert that really matters. Everything else is a counter you look at
+# once this fires.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata: { name: obsync, namespace: obsync }
+spec:
+  groups:
+    - name: obsync
+      rules:
+        - alert: ObsyncStale
+          expr: time() - obsync_last_success_timestamp_seconds > 86400
+          for: 1h
+          annotations:
+            summary: "obsync has not completed a successful run in 24h"
+        - alert: ObsyncTokenRejected
+          # A 401 is fatal, not transient. NUS tokens expire.
+          expr: increase(obsync_canvas_unauthorized_total[1h]) > 0
+          annotations:
+            summary: "Canvas token rejected, worker is dead until it is replaced"
