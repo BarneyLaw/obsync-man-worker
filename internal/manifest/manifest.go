@@ -131,10 +131,21 @@ func (m *Manifest) Validate() error {
 	if m.RunID == "" {
 		return fmt.Errorf("manifest: empty run id")
 	}
+	// An empty course is [], never absent: absent means a truncated or foreign
+	// document, and treating it as "Canvas has nothing" would tombstone every
+	// file in the consumer's vault.
+	if m.Entries == nil {
+		return fmt.Errorf("manifest: entries missing")
+	}
 	seen := map[string]bool{}
 	for i, e := range m.Entries {
 		if e.Path == "" {
 			return fmt.Errorf("manifest: entry %d has empty path", i)
+		}
+		switch e.State {
+		case StateStored, StateSkipped, StateLocked, StateFailed, StateDeleted:
+		default:
+			return fmt.Errorf("manifest: %q has unknown state %q", e.Path, e.State)
 		}
 		if seen[e.Path] {
 			return fmt.Errorf("manifest: duplicate path %q", e.Path)

@@ -1,0 +1,252 @@
+package manifest_test
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"flag"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/leifsen/obsync/internal/manifest"
+	"github.com/leifsen/obsync/internal/plan"
+)
+
+// The worker and the plugin ship as a pair. These fixtures are the contract
+// between them, and the Go types OWN them: this test writes them with -update
+// and otherwise fails if they drift from what the worker actually produces.
+// plugin/src/contract.test.ts reads the same files.
+//
+//	go test ./internal/manifest -run TestContractFixtures -update
+var update = flag.Bool("update", false, "rewrite schema/ contract fixtures from the Go types")
+
+func schemaPath(name string) string { return filepath.Join("..", "..", "schema", name) }
+
+func sha(s string) string {
+	h := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(h[:])
+}
+
+func at(s string) time.Time {
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		panic(err)
+	}
+	return t
+}
+
+func ptr(t time.Time) *time.Time { return &t }
+
+// goldenManifest exercises every state and every field the worker writes,
+// including the cases the plugin must render specially: stand-in names, a
+// kept previous version, and a skip deferred by a scoped pull.
+func goldenManifest() *manifest.Manifest {
+	t0, t1 := at("2026-08-11T02:15:00Z"), at("2026-09-12T09:30:00Z")
+	return &manifest.Manifest{
+		SchemaVersion: manifest.SchemaVersion,
+		CourseID:      93794,
+		CourseName:    "CS3103 Computer Networks Practice",
+		RunID:         "20260913T150255Z-c3e4",
+		PrevRunID:     "20260913T061700Z-0a1b",
+		GeneratedAt:   at("2026-09-13T15:03:10Z"),
+		RulesHash:     sha("deploy/rules.json"),
+		Entries: []manifest.Entry{
+			{
+				Path: "Labs/labs-intro.pdf", State: manifest.StateStored,
+				Size: 458180, MIME: "application/pdf", CanvasID: 1001, CanvasUUID: "u-1001",
+				UpdatedAt: t0, ModifiedAt: t0, SHA256: sha("labs-intro.pdf"),
+			},
+			{
+				Path: "Tutorials/canvas-file-1002.pdf", State: manifest.StateStored,
+				Size: 20480, MIME: "application/pdf", CanvasID: 1002, CanvasUUID: "u-1002",
+				UpdatedAt: t0, ModifiedAt: t0, SHA256: sha("canvas-file-1002.pdf"),
+				Reason: `Canvas name "???.pdf" could not be made portable (portable: component "???.pdf" is empty after sanitisation); stored as "canvas-file-1002.pdf"`,
+			},
+			{
+				Path: "Lecture Notes/L1- Introduction.pdf", State: manifest.StateStored,
+				Size: 3022799, MIME: "application/pdf", CanvasID: 1003, CanvasUUID: "u-1003",
+				UpdatedAt: t0, ModifiedAt: t0, SHA256: sha("L1 v1"),
+				Reason: "refresh failed in run 20260913T150255Z-c3e4 (connection reset); serving the version from run 20260913T061700Z-0a1b or earlier",
+			},
+			{
+				Path: "Q1- what (1004).pdf", State: manifest.StateStored,
+				Size: 1200, MIME: "application/pdf", CanvasID: 1004,
+				UpdatedAt: t0, ModifiedAt: t0, SHA256: sha("q1 first"),
+			},
+			{
+				Path: "Q1- what (1005).pdf", State: manifest.StateStored,
+				Size: 1300, MIME: "application/pdf", CanvasID: 1005,
+				UpdatedAt: t0, ModifiedAt: t0, SHA256: sha("q1 second"),
+			},
+			{
+				Path: "Recordings/Week 1.mp4", State: manifest.StateSkipped,
+				Size: 734003200, MIME: "video/mp4", CanvasID: 1006,
+				UpdatedAt: t0, ModifiedAt: t0,
+				RuleName: "no-video", Reason: `rule "no-video": extension .mp4`,
+			},
+			{
+				Path: "Sample Codes/tcpclient.c", State: manifest.StateSkipped,
+				Size: 2360, MIME: "text/x-c", CanvasID: 1007,
+				UpdatedAt: t0, ModifiedAt: t0,
+				RuleName: plan.ScopeRule, Reason: "outside the scope of a manual pull; the next full pull fetches it",
+			},
+			{
+				Path: "Assignment/Assignment 3.pdf", State: manifest.StateLocked,
+				Size: 526000, MIME: "application/pdf", CanvasID: 1008,
+				UpdatedAt: t1, ModifiedAt: t1, UnlockAt: ptr(at("2026-10-01T00:00:00Z")),
+				Reason: "locked in Canvas",
+			},
+			{
+				Path: "Labs/2026-lab4.pdf", State: manifest.StateFailed,
+				Size: 10, MIME: "application/pdf", CanvasID: 1009,
+				UpdatedAt: t1, ModifiedAt: t1,
+				Reason: "size mismatch: Canvas reports 10 bytes, received 4",
+			},
+			{
+				Path: "Old/syllabus-v1.pdf", State: manifest.StateDeleted,
+				Size: 99000, MIME: "application/pdf", CanvasID: 1010,
+				UpdatedAt: t0, ModifiedAt: t0, DeletedAt: ptr(at("2026-09-13T15:03:10Z")),
+				Reason: "no longer present in Canvas (was stored)",
+			},
+		},
+	}
+}
+
+type keyCase struct {
+	CourseID    int64  `json:"course_id"`
+	RunID       string `json:"run_id"`
+	SHA256      string `json:"sha256"`
+	LatestKey   string `json:"latest_key"`
+	ManifestKey string `json:"manifest_key"`
+	BlobKey     string `json:"blob_key"`
+}
+
+type storeContract struct {
+	Comment       []string  `json:"_comment"`
+	SchemaVersion int       `json:"schema_version"`
+	ScopeRule     string    `json:"scope_rule"`
+	States        []string  `json:"states"`
+	Keys          []keyCase `json:"keys"`
+}
+
+func goldenStoreContract() storeContract {
+	c := storeContract{
+		Comment: []string{
+			"Generated by internal/manifest/contract_test.go. Do not edit by hand:",
+			"go test ./internal/manifest -run TestContractFixtures -update",
+			"",
+			"The store layout and constants the plugin must reproduce exactly.",
+		},
+		SchemaVersion: manifest.SchemaVersion,
+		ScopeRule:     plan.ScopeRule,
+		States: []string{
+			string(manifest.StateStored), string(manifest.StateSkipped), string(manifest.StateLocked),
+			string(manifest.StateFailed), string(manifest.StateDeleted),
+		},
+	}
+	for _, k := range []struct {
+		course int64
+		run    string
+		body   string
+	}{
+		{93794, "20260913T150255Z-c3e4", "labs-intro.pdf"},
+		{1, "20260101T000000Z-0000", ""},
+	} {
+		h := sha(k.body)
+		c.Keys = append(c.Keys, keyCase{
+			CourseID: k.course, RunID: k.run, SHA256: h,
+			LatestKey:   manifest.LatestKey(k.course),
+			ManifestKey: manifest.ManifestKey(k.course, k.run),
+			BlobKey:     manifest.BlobKey(h),
+		})
+	}
+	return c
+}
+
+func TestContractFixtures(t *testing.T) {
+	var buf bytes.Buffer
+	if err := manifest.Encode(&buf, goldenManifest()); err != nil {
+		t.Fatal(err)
+	}
+	checkFixture(t, "manifest-golden.json", buf.Bytes())
+
+	sc, err := json.MarshalIndent(goldenStoreContract(), "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkFixture(t, "store-contract.json", append(sc, '\n'))
+
+	// And the fixture must decode through the same path the worker reads.
+	f, err := os.Open(schemaPath("manifest-golden.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if _, err := manifest.Decode(f); err != nil {
+		t.Fatalf("manifest-golden.json does not decode: %v", err)
+	}
+}
+
+func checkFixture(t *testing.T, name string, want []byte) {
+	t.Helper()
+	path := schemaPath(name)
+	if *update {
+		if err := os.WriteFile(path, want, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		t.Logf("wrote %s", path)
+		return
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("%s missing; generate it with -update: %v", name, err)
+	}
+	// A Windows checkout may have converted line endings.
+	got = bytes.ReplaceAll(got, []byte("\r\n"), []byte("\n"))
+	if !bytes.Equal(got, want) {
+		t.Errorf("schema/%s does not match what the worker writes (stale or hand-edited).\n"+
+			"Regenerate: go test ./internal/manifest -run TestContractFixtures -update\n"+
+			"first difference at line %d", name, firstDiffLine(got, want))
+	}
+}
+
+func firstDiffLine(a, b []byte) int {
+	al, bl := strings.Split(string(a), "\n"), strings.Split(string(b), "\n")
+	for i := 0; i < len(al) && i < len(bl); i++ {
+		if al[i] != bl[i] {
+			return i + 1
+		}
+	}
+	return min(len(al), len(bl)) + 1
+}
+
+// Both halves must refuse the same malformed manifests: a consumer that
+// accepts what the worker would never write will corrupt a vault on the first
+// truncated download. plugin/src/contract.test.ts runs the same cases.
+func TestInvalidManifestsAreRejected(t *testing.T) {
+	raw, err := os.ReadFile(schemaPath("manifest-invalid.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var f struct {
+		Cases []struct {
+			Why      string          `json:"_why"`
+			Manifest json.RawMessage `json:"manifest"`
+		} `json:"cases"`
+	}
+	if err := json.Unmarshal(raw, &f); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.Cases) == 0 {
+		t.Fatal("no invalid cases")
+	}
+	for i, c := range f.Cases {
+		if _, err := manifest.Decode(bytes.NewReader(c.Manifest)); err == nil {
+			t.Errorf("invalid manifest %d accepted: %s", i, c.Why)
+		}
+	}
+}
