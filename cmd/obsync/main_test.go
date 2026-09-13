@@ -29,7 +29,7 @@ func serveFixture(t *testing.T) *httptest.Server {
 		}
 	}
 	srv := httptest.NewServer(&storeHandler{
-		fs: fsStore, log: slog.New(slog.NewTextHandler(io.Discard, nil)), bucket: "obsync",
+		st: fsStore, log: slog.New(slog.NewTextHandler(io.Discard, nil)), bucket: "obsync",
 	})
 	t.Cleanup(srv.Close)
 	return srv
@@ -78,6 +78,19 @@ func TestServeAcceptsBucketPrefix(t *testing.T) {
 		if resp, _ := get(t, srv, "GET", p, nil); resp.StatusCode != http.StatusNotFound {
 			t.Errorf("GET %s = %d, want 404", p, resp.StatusCode)
 		}
+	}
+}
+
+// Multi-range requests seek more than once; each range must come back exact.
+func TestServeMultiRange(t *testing.T) {
+	srv := serveFixture(t)
+	resp, body := get(t, srv, "GET", "/blobs/sha256/ab/cd/abcd", map[string]string{"Range": "bytes=0-1,7-9"})
+	if resp.StatusCode != http.StatusPartialContent || !strings.Contains(body, "01") || !strings.Contains(body, "789") {
+		t.Fatalf("multi-range: %d %q", resp.StatusCode, body)
+	}
+	resp, body = get(t, srv, "HEAD", "/blobs/sha256/ab/cd/abcd", nil)
+	if resp.StatusCode != 200 || body != "" || resp.ContentLength != 10 {
+		t.Fatalf("HEAD: %d len=%d body=%q", resp.StatusCode, resp.ContentLength, body)
 	}
 }
 

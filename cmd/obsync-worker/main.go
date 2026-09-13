@@ -29,7 +29,6 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"runtime"
 	"strings"
 	"syscall"
@@ -102,7 +101,7 @@ type commonFlags struct {
 
 func (c *commonFlags) register(fs *flag.FlagSet) {
 	fs.StringVar(&c.rules, "rules", "/etc/obsync/rules.json", "path to worker rules")
-	fs.StringVar(&c.fsStore, "fs-store", "", "use a local directory as the store (dev)")
+	fs.StringVar(&c.fsStore, "fs-store", "", "use a local directory as the store; without it GARAGE_* selects S3")
 	fs.StringVar(&c.gateway, "pushgateway", "", "prometheus pushgateway url")
 	fs.StringVar(&c.logLevel, "log-level", "info", "debug, info, warn or error")
 	fs.StringVar(&c.tmpDir, "tmp-dir", "", "directory for in-flight downloads (default: OS temp dir)")
@@ -212,13 +211,12 @@ func cmdPass(cmd string, args []string) int {
 	p.src = src
 	log.Info("canvas.configured", "base_url", src.BaseURL)
 
-	if c.fsStore == "" {
-		// TODO(step 5): construct store.S3 from GARAGE_* env.
-		return p.configError(errors.New("no store configured; pass -fs-store while S3 is still a stub"))
+	raw, desc, err := store.Open(c.fsStore, os.Getenv)
+	if err != nil {
+		return p.configError(err)
 	}
-	root, _ := filepath.Abs(c.fsStore)
-	log.Info("store.configured", "kind", "fs", "root", root)
-	st := store.WithLogging(store.NewFS(c.fsStore), log)
+	log.Info("store.configured", "kind", desc.Kind, "location", desc.Location)
+	st := store.WithLogging(raw, log)
 	p.store = st
 
 	r := &run.Runner{
