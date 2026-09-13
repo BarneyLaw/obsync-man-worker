@@ -17,6 +17,7 @@ on:
       - 'go.mod'
       - 'go.sum'
       - 'deploy/rules.json'
+      - 'scripts/garage-dev.sh'
       - '.github/workflows/worker.yml'
       # contract (identical in plugin.yml)
       - 'schema/**'
@@ -38,6 +39,7 @@ on:
       - 'go.mod'
       - 'go.sum'
       - 'deploy/rules.json'
+      - 'scripts/garage-dev.sh'
       - '.github/workflows/worker.yml'
       # contract (identical in plugin.yml)
       - 'schema/**'
@@ -113,3 +115,46 @@ jobs:
           ./bin/obsync-worker help
           mkdir -p "$RUNNER_TEMP/store"
           ./bin/obsync -fs-store "$RUNNER_TEMP/store" ls
+
+  garage:
+    name: S3 integration against Garage
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      # The same script developers run; it prints GARAGE_* for the tests.
+      - name: Start a single-node Garage
+        run: scripts/garage-dev.sh up --plain >> "$GITHUB_ENV"
+
+      - name: S3 integration tests
+        env:
+          OBSYNC_REQUIRE_S3: "1"
+        run: go test -count=1 -v -run 'S3' ./internal/store ./internal/run
+
+      # obsync serve in front of Garage is the credential-free path for the
+      # plugin. Check it starts against S3 and answers like the plugin expects.
+      - name: Serve Garage to a plugin-shaped client
+        run: |
+          go build -o bin/obsync ./cmd/obsync
+          ./bin/obsync ls
+          ./bin/obsync serve -addr 127.0.0.1:8765 &
+          code=$(curl -s -o /dev/null -w '%{http_code}' --retry 30 --retry-connrefused --retry-delay 1 \
+            http://127.0.0.1:8765/obsync/manifests/0/latest)
+          if [ "$code" != 404 ]; then
+            echo "::error::serve over S3 answered $code for a missing manifest, want 404"
+            exit 1
+          fi
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8765/locks/worker.json)
+          if [ "$code" != 404 ]; then
+            echo "::error::serve exposed locks/ (status $code)"
+            exit 1
+          fi
+
+      - name: Garage logs
+        if: failure()
+        run: docker logs --tail 200 obsync-garage
