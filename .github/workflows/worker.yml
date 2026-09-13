@@ -1,0 +1,115 @@
+# Validates the Go half of obsync: the worker, the inspection CLI, and the
+# contract fixtures in schema/ that the plugin reads.
+#
+# Triggers on worker changes, and on any change to the worker<->plugin
+# contract from EITHER side, because the two ship as a pair. The contract block
+# below is identical in plugin.yml: when it matches, both workflows run and
+# each half is checked against the same fixtures. Keep the two blocks in sync.
+name: worker
+
+on:
+  push:
+    branches: [main]
+    paths:
+      # worker
+      - 'cmd/**'
+      - 'internal/**'
+      - 'go.mod'
+      - 'go.sum'
+      - 'deploy/rules.json'
+      - '.github/workflows/worker.yml'
+      # contract (identical in plugin.yml)
+      - 'schema/**'
+      - 'internal/manifest/**'
+      - 'internal/policy/**'
+      - 'internal/plan/**'
+      - 'cmd/obsync/**'
+      - 'plugin/src/types.ts'
+      - 'plugin/src/policy.ts'
+      - 'plugin/src/preview.ts'
+      - 'plugin/src/store.ts'
+      - 'plugin/src/sync.ts'
+      - 'plugin/src/*.test.ts'
+  pull_request:
+    paths:
+      # worker
+      - 'cmd/**'
+      - 'internal/**'
+      - 'go.mod'
+      - 'go.sum'
+      - 'deploy/rules.json'
+      - '.github/workflows/worker.yml'
+      # contract (identical in plugin.yml)
+      - 'schema/**'
+      - 'internal/manifest/**'
+      - 'internal/policy/**'
+      - 'internal/plan/**'
+      - 'cmd/obsync/**'
+      - 'plugin/src/types.ts'
+      - 'plugin/src/policy.ts'
+      - 'plugin/src/preview.ts'
+      - 'plugin/src/store.ts'
+      - 'plugin/src/sync.ts'
+      - 'plugin/src/*.test.ts'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: worker-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Vet, test, build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: go.mod and go.sum are tidy
+        run: go mod tidy -diff
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l cmd internal)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::these files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: Test with the race detector
+        run: go test -race -count=1 ./...
+
+      # The test above already fails on a stale fixture. Regenerating and
+      # diffing shows exactly which contract bytes the change moved, so a
+      # reviewer can see what the plugin will now receive.
+      - name: Contract fixtures are generated from the Go types
+        run: |
+          go test ./internal/manifest -run TestContractFixtures -count=1 -update
+          git diff --exit-code -- schema/
+
+      - name: Build
+        run: |
+          go build -trimpath -o bin/obsync-worker ./cmd/obsync-worker
+          go build -trimpath -o bin/obsync ./cmd/obsync
+
+      - name: Cross-compile for developer machines
+        run: |
+          GOOS=windows GOARCH=amd64 go build ./cmd/...
+          GOOS=darwin GOARCH=arm64 go build ./cmd/...
+
+      - name: Smoke test the binaries
+        run: |
+          ./bin/obsync-worker help
+          mkdir -p "$RUNNER_TEMP/store"
+          ./bin/obsync -fs-store "$RUNNER_TEMP/store" ls

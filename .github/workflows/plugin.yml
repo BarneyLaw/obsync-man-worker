@@ -1,0 +1,121 @@
+# Validates the Obsidian plugin: lint, tests (including the contract fixtures
+# in schema/ that the Go worker generates), type-check, bundle, and release
+# metadata.
+#
+# Triggers on plugin changes, and on any change to the worker<->plugin
+# contract from EITHER side, because the two ship as a pair. The contract block
+# below is identical in worker.yml: when it matches, both workflows run and
+# each half is checked against the same fixtures. Keep the two blocks in sync.
+name: plugin
+
+on:
+  push:
+    branches: [main]
+    paths:
+      # plugin
+      - 'plugin/**'
+      - '!plugin/**/*.md'
+      - '.github/workflows/plugin.yml'
+      # contract (identical in worker.yml)
+      - 'schema/**'
+      - 'internal/manifest/**'
+      - 'internal/policy/**'
+      - 'internal/plan/**'
+      - 'cmd/obsync/**'
+      - 'plugin/src/types.ts'
+      - 'plugin/src/policy.ts'
+      - 'plugin/src/preview.ts'
+      - 'plugin/src/store.ts'
+      - 'plugin/src/sync.ts'
+      - 'plugin/src/*.test.ts'
+  pull_request:
+    paths:
+      # plugin
+      - 'plugin/**'
+      - '!plugin/**/*.md'
+      - '.github/workflows/plugin.yml'
+      # contract (identical in worker.yml)
+      - 'schema/**'
+      - 'internal/manifest/**'
+      - 'internal/policy/**'
+      - 'internal/plan/**'
+      - 'cmd/obsync/**'
+      - 'plugin/src/types.ts'
+      - 'plugin/src/policy.ts'
+      - 'plugin/src/preview.ts'
+      - 'plugin/src/store.ts'
+      - 'plugin/src/sync.ts'
+      - 'plugin/src/*.test.ts'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: plugin-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: plugin
+
+jobs:
+  validate:
+    name: Lint, test, build (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22.x, 24.x]
+    steps:
+      # Whole repo, not just plugin/: the tests read ../schema.
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: plugin/package-lock.json
+
+      - run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Test, including the shared contract fixtures
+        run: npm test
+
+      - name: Type-check and bundle
+        run: npm run build
+
+      - name: manifest.json, versions.json and package.json agree
+        run: |
+          node --input-type=module -e '
+            import { readFileSync } from "node:fs";
+            const read = (f) => JSON.parse(readFileSync(f, "utf8"));
+            const manifest = read("manifest.json");
+            const pkg = read("package.json");
+            const versions = read("versions.json");
+            const errors = [];
+            if (pkg.version !== manifest.version) {
+              errors.push(`package.json is ${pkg.version} but manifest.json is ${manifest.version}`);
+            }
+            if (versions[manifest.version] !== manifest.minAppVersion) {
+              errors.push(`versions.json maps ${manifest.version} to ${versions[manifest.version]}, manifest.json minAppVersion is ${manifest.minAppVersion}`);
+            }
+            for (const e of errors) console.log(`::error::${e}`);
+            if (errors.length > 0) process.exit(1);
+            console.log(`obsync ${manifest.version}, Obsidian >= ${manifest.minAppVersion}`);
+          '
+
+      - name: Upload the plugin bundle
+        if: matrix.node == '24.x'
+        uses: actions/upload-artifact@v4
+        with:
+          name: obsync-plugin
+          path: |
+            plugin/main.js
+            plugin/manifest.json
+            plugin/styles.css
+          if-no-files-found: error
