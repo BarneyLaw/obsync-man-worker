@@ -346,10 +346,22 @@ in Go and one in TypeScript is not duplication. Resist building a Go consumer
 daemon as well, or you maintain two implementations of the same thing and mobile
 still does not work.
 
-What they *do* share is the manifest schema and the rule engine.
-`schema/policy-golden.json` is a fixture both test suites load. Fifteen assertions
-per side, and it catches every drift before the user sees a preview that does not
-match what the worker did.
+What they *do* share is the manifest schema and the rule engine, and both are
+pinned by fixtures in `schema/` that both test suites load. They catch every
+drift before the user sees a preview that does not match what the worker did.
+
+| Fixture | Owner | Go reads it in | Plugin reads it in |
+|---|---|---|---|
+| `policy-golden.json` | hand-written | `internal/policy` (decisions, and `invalid` policies `Parse` must reject) | `policy.test.ts` (same, via `validate`) |
+| `manifest-golden.json` | **generated** by the Go types | `internal/manifest` (byte-for-byte equal to what `Encode` writes) | `contract.test.ts`, `preview.test.ts` |
+| `store-contract.json` | **generated** | `internal/manifest` | `contract.test.ts` (key layout, `obsync:pull-scope`, states) |
+| `manifest-invalid.json` | hand-written | `internal/manifest` (`Decode` must refuse) | `contract.test.ts` (`parseManifest` must refuse) |
+
+The generated fixtures are rewritten with
+`go test ./internal/manifest -run TestContractFixtures -update`, so a change to
+what the worker writes shows up as a diff in `schema/` that the plugin suite then
+runs against. CI is split to match: `worker.yml` and `plugin.yml` each run when
+their half changes, and both run when any contract path changes.
 
 ### Researched implementation choices
 

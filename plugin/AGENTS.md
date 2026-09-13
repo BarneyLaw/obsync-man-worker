@@ -37,7 +37,8 @@ npm run build
 
 - ESLint is preconfigured with `eslint-plugin-obsidianmd` for Obsidian-specific rules.
 - Run `npm run lint` to lint the project.
-- A GitHub Action automatically lints every commit on all branches.
+- CI lives at the repository root, not here: `.github/workflows/plugin.yml` runs lint, tests, type-check and bundle whenever the plugin or the worker<->plugin contract (`schema/`, the Go manifest/policy packages) changes.
+- The policy and manifest contract fixtures are in the repository root's `schema/`. Never copy them into `plugin/`.
 
 ## File & folder conventions
 

@@ -17,8 +17,9 @@ from there into an Obsidian vault. One-way. See [DESIGN.md](DESIGN.md).
 | `cmd/obsync-worker` run / pull / courses | done |
 | `cmd/obsync` ls / preview / log / diff / cat / gc / serve | done |
 | `internal/obs` | JSON audit log; Pushgateway not wired |
-| plugin: types/policy/preview | done, cross-tested against Go |
-| plugin: sync/store/UI | written, untested in a real vault |
+| plugin: types/policy/preview | done, contract-tested against the Go fixtures in `schema/` |
+| plugin: sync/store/UI | sync unit-tested against an in-memory adapter; untested in a real vault |
+| CI | `worker.yml` and `plugin.yml`, path-filtered, both on contract changes |
 
 ## Worker commands
 
@@ -116,16 +117,49 @@ go build -o bin/obsync-worker.exe ./cmd/obsync-worker; go build -o bin/obsync.ex
 
 ```sh
 cd plugin
-npm install
-npm test                     # cross-checks the rule engine against the Go golden fixture
-npm run dev                  # esbuild watch
+npm ci
+npm test                     # vitest, including the contract fixtures in ../schema
+npm run lint
+npm run dev                  # esbuild watch into main.js
 ln -s $PWD ~/ObsidianDev/.obsidian/plugins/obsync
 ```
 
 On Windows, link with a junction instead:
 `cmd /c mklink /J "%USERPROFILE%\ObsidianDev\.obsidian\plugins\obsync" "%CD%"`.
 
+Point it at a dev store: run `obsync serve`, then in the plugin's Setup set
+**Store URL** to `http://127.0.0.1:8765`, leave **Bucket** as `obsync` (or
+empty; `serve` accepts both), and put the numeric id from `obsync ls` in
+**Course IDs**.
+
 Requires Obsidian >= 1.12.3 for `appendBinary`.
+
+## The worker/plugin contract and CI
+
+The worker and the plugin ship as a pair, so the contract between them is
+checked from both sides against the same files in `schema/`:
+
+| File | Written by | Checked by |
+|---|---|---|
+| `policy-golden.json` | hand | Go `internal/policy`, plugin `policy.test.ts` |
+| `manifest-golden.json` | `go test ./internal/manifest -run TestContractFixtures -update` | Go (byte-for-byte), plugin `contract.test.ts`, `preview.test.ts` |
+| `store-contract.json` | same command | Go, plugin `contract.test.ts` |
+| `manifest-invalid.json` | hand | Go `Decode`, plugin `parseManifest` |
+
+Never edit a generated fixture by hand; never copy any of them into `plugin/`.
+
+CI is two workflows in `.github/workflows/`:
+
+| Workflow | Runs when these change | Does |
+|---|---|---|
+| `worker.yml` | `cmd/`, `internal/`, `go.mod`, `go.sum`, `deploy/rules.json` | tidy, gofmt, vet, race tests, fixture regeneration diff, build, cross-compile, smoke |
+| `plugin.yml` | `plugin/` (not Markdown) | `npm ci`, lint, tests, type-check and bundle on Node 22 and 24, release metadata, bundle artifact |
+| **both** | `schema/`, `internal/manifest`, `internal/policy`, `internal/plan`, `cmd/obsync`, and the plugin's `types`, `policy`, `preview`, `store`, `sync` and tests | cross-check each half against the same contract |
+
+The contract path list is identical in both files; change them together. Each
+runs on pushes to `main`, on pull requests, and manually. Because of the path
+filters, a workflow that does not apply to a PR never reports, so do not make
+either one a blanket required check.
 
 ## Before you start
 
