@@ -1,15 +1,26 @@
-.PHONY: test build run-dev lint plugin
+.PHONY: test build lint courses run-dev pull-dev serve-dev plugin
+# Every recipe is one plain command, so on Windows without make you can paste
+# it into a shell directly (add .exe to the binary names).
 test:
 	go test ./... -race
+lint:
+	gofmt -l cmd internal
+	go vet ./...
 build:
 	go build -o bin/obsync-worker ./cmd/obsync-worker
 	go build -o bin/obsync         ./cmd/obsync
+# Which course codes and ids exist, and whether their files are reachable.
+courses: build
+	./bin/obsync-worker courses -probe
 # Full pipeline into a local directory. No Garage, no cluster.
 run-dev: build
-	CANVAS_BASE_URL=$$CANVAS_BASE_URL CANVAS_TOKEN=$$CANVAS_TOKEN \
-	  ./bin/obsync-worker -rules=deploy/rules.json -fs-store=./.obsync-store
+	./bin/obsync-worker run -rules=deploy/rules.json -fs-store=./.obsync-store
 	./bin/obsync -fs-store=./.obsync-store ls
-lint:
-	go vet ./...
+# Manual pull of one course: make pull-dev COURSE=CS3103 [DRY=1]
+pull-dev: build
+	./bin/obsync-worker pull -rules=deploy/rules.json -fs-store=./.obsync-store -course=$(COURSE) $(if $(DRY),-dry-run)
+# Read-only HTTP view of the dev store; point the plugin's base URL at it.
+serve-dev: build
+	./bin/obsync -fs-store=./.obsync-store serve
 plugin:
 	cd plugin && npm run build

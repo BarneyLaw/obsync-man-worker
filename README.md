@@ -7,24 +7,109 @@ from there into an Obsidian vault. One-way. See [DESIGN.md](DESIGN.md).
 
 | Component | State |
 |---|---|
-| `internal/portable`, `policy`, `manifest`, `plan` | done, tests green |
-| `internal/canvas` | client + rate limiter written, untested against live Canvas |
-| `internal/store` FS + Memory | done |
+| `internal/portable`, `policy`, `manifest`, `plan`, `scope` | done, tests green |
+| `internal/canvas` | client + rate limiter, tested against httptest; token and files API verified on NUS Canvas |
+| `internal/store` FS + Memory + logging wrapper | done |
 | `internal/store` S3 | stub, build step 5 |
-| `internal/run` | sequenced, downloads still serial |
-| `cmd/obsync` ls/preview/cat | done; log/diff/gc stubbed |
-| `internal/obs` | logs only, Pushgateway not wired |
+| `internal/lease` | done; exclusive on FS/Memory, S3 needs `If-None-Match` |
+| `internal/run` | hardened, audit-logged; downloads still serial |
+| `internal/gc` | done |
+| `cmd/obsync-worker` run / pull / courses | done |
+| `cmd/obsync` ls / preview / log / diff / cat / gc / serve | done |
+| `internal/obs` | JSON audit log; Pushgateway not wired |
 | plugin: types/policy/preview | done, cross-tested against Go |
 | plugin: sync/store/UI | written, untested in a real vault |
 
-## Dev loop, no cluster needed
+## Worker commands
 
 ```sh
-make test                    # go test ./... -race
-export CANVAS_BASE_URL=https://canvas.nus.edu.sg
-export CANVAS_TOKEN=...
-make run-dev                 # full pipeline into ./.obsync-store
-./bin/obsync -fs-store=./.obsync-store preview <course-id>
+obsync-worker run      # scheduled pass over every active course (the CronJob)
+obsync-worker pull     # manual pull, outside the schedule
+obsync-worker courses  # list active courses; -probe checks their files are reachable
+```
+
+`pull` targets exactly what you ask for:
+
+```sh
+# one course, everything
+obsync-worker pull -course CS3103 -rules deploy/rules.json -fs-store .obsync-store
+
+# only some directories and files (paths as `obsync ls <course>` prints them)
+obsync-worker pull -course CS3103 -path "Week 1" -path "Tutorials/T3.pdf" ...
+
+# globs: * is one path segment, ** spans any number
+obsync-worker pull -course CS3103 -path "**/*.pdf" ...
+
+# see every decision without downloading or writing anything
+obsync-worker pull -course CS3103 -path "Week 1" -dry-run ...
+
+# a scheduled run is in progress: wait for it instead of exiting 3
+obsync-worker pull -course CS3103 -wait 15m ...
+```
+
+Scope limits what is downloaded, never what is catalogued. Files outside it keep
+what the store already had; files never fetched are listed as skipped with rule
+`obsync:pull-scope` and the next full run fetches them. Patterns are
+case-insensitive, and one that matches nothing fails the pull.
+
+Exit codes: `0` ok, `1` failed, `2` usage or config, `3` another run holds the
+lease, `4` Canvas rejected the token.
+
+**In the cluster**, `kubectl -n obsync create job --from=cronjob/obsync-worker
+obsync-manual-$(date +%s)` runs a full pass now. It is safe next to the
+schedule: the store lease makes one of them exit 3.
+
+## Store inspection
+
+```sh
+obsync ls                        # every course: last run, counts, size
+obsync ls <course-id>            # the file tree with real names
+obsync preview <course-id>       # what a vault gets, and everything withheld with why
+obsync log <course-id>           # run history with added/removed/changed counts
+obsync diff <course-id> <a> latest
+obsync cat <course-id> <path>    # stream a file, verifying its hash
+obsync gc                        # report unreferenced blobs; -apply deletes
+obsync serve                     # read-only HTTP on 127.0.0.1:8765 for the plugin
+```
+
+## Audit log
+
+Every non-trivial action is one JSON line on stderr: a stable event name in
+`msg`, plus `run_id`, `course_id` and the details. For example:
+
+```sh
+obsync-worker pull ... 2> pull.log
+jq 'select(.msg=="latest.published")' pull.log                 # every commit
+jq 'select(.msg=="plan.skip") | {path, rule, reason}' pull.log  # what was withheld, why
+jq 'select(.level=="WARN" or .level=="ERROR")' pull.log
+```
+
+Each writing pass also leaves `runs/<run_id>.json` in the store: trigger, host,
+rules hash, scope, and per-course outcome and counts. Use `-log-level debug` to
+also see unchanged files and store reads.
+
+## Dev loop, no cluster needed
+
+bash:
+
+```sh
+set -a; . ./.env; set +a
+make test
+make courses                         # find the course code
+make pull-dev COURSE=CS3103 DRY=1    # plan only
+make pull-dev COURSE=CS3103          # full pipeline into ./.obsync-store
+make serve-dev                       # plugin base URL: http://127.0.0.1:8765
+```
+
+PowerShell (no make):
+
+```powershell
+Get-Content .env | ForEach-Object {
+  if ($_ -match '^\s*(?:export\s+)?(\w+)=(.*)$') { Set-Item "env:$($Matches[1])" $Matches[2].Trim('"', "'") }
+}
+go build -o bin/obsync-worker.exe ./cmd/obsync-worker; go build -o bin/obsync.exe ./cmd/obsync
+./bin/obsync-worker.exe pull -course CS3103 -rules deploy/rules.json -fs-store .obsync-store
+./bin/obsync.exe serve
 ```
 
 ## Plugin
@@ -37,9 +122,14 @@ npm run dev                  # esbuild watch
 ln -s $PWD ~/ObsidianDev/.obsidian/plugins/obsync
 ```
 
+On Windows, link with a junction instead:
+`cmd /c mklink /J "%USERPROFILE%\ObsidianDev\.obsidian\plugins\obsync" "%CD%"`.
+
 Requires Obsidian >= 1.12.3 for `appendBinary`.
 
 ## Before you start
 
 Confirm NUS has not disabled manual access token generation in Canvas user
-settings. If it has, phase 1 has no data source.
+settings. If it has, phase 1 has no data source. (Verified working on
+2026-09-13.) Some courses hide the Files tab from students; `courses -probe`
+shows which, and scheduled runs record them as `forbidden` rather than failing.

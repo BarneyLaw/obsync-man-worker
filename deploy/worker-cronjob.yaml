@@ -7,6 +7,9 @@ spec:
   # LOAD BEARING. The entire design assumes exactly one writer, because
   # manifests/<course>/latest is a read-modify-write with no compare-and-swap.
   # Two concurrent workers will clobber each other. Do not relax this.
+  # Forbid only covers Jobs this CronJob creates; manual pulls
+  # (kubectl create job --from=cronjob/obsync-worker, or obsync-worker pull)
+  # are held off by the store lease instead, and exit 3 if a run is in progress.
   concurrencyPolicy: Forbid
   startingDeadlineSeconds: 600
   successfulJobsHistoryLimit: 3
@@ -27,7 +30,7 @@ spec:
           containers:
             - name: worker
               image: ghcr.io/leifsen/obsync-worker:latest
-              args: ["-rules=/etc/obsync/rules.json", "-pushgateway=http://pushgateway.monitoring:9091"]
+              args: ["run", "-rules=/etc/obsync/rules.json", "-pushgateway=http://pushgateway.monitoring:9091", "-tmp-dir=/tmp"]
               env:
                 - name: CANVAS_BASE_URL
                   value: "https://canvas.nus.edu.sg"
@@ -43,9 +46,15 @@ spec:
                   valueFrom: { secretKeyRef: { name: obsync-secrets, key: garage-secret-key } }
               volumeMounts:
                 - { name: rules, mountPath: /etc/obsync }
+                - { name: tmp,   mountPath: /tmp }
               resources:
                 requests: { cpu: 100m, memory: 256Mi }
                 limits:   { memory: 1Gi }
           volumes:
             - name: rules
               configMap: { name: obsync-rules }
+            # Downloads stream to disk while they are hashed, so memory stays
+            # flat however large the file. Size this above the largest file
+            # the rules let through (keep-slides exempts PDFs from the cap).
+            - name: tmp
+              emptyDir: { sizeLimit: 5Gi }

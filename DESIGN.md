@@ -111,6 +111,15 @@ so two concurrent workers clobber each other. Phase 1 is safe because
 `concurrencyPolicy: Forbid` guarantees one writer. **This is one of the
 assumptions that breaks in phase 2.** Write it down.
 
+It already bends in phase 1: manual pulls (`obsync-worker pull`, or
+`kubectl create job --from=cronjob/...`) are not counted by Forbid. So every
+writer also takes a lease, `locks/worker.json`, created with an exclusive put
+and re-verified immediately before each `latest` publish. A crashed run's lease
+is stealable after its TTL; because stealing is delete-then-create, the
+pre-commit verify is what guarantees at most one stealer commits. `gc -apply`
+takes the same lease. On a backend without exclusive create the lease is
+best-effort and logs that it is.
+
 GC is a separate command, never in the worker: walk reachable manifests, list
 `blobs/`, delete the difference, skip anything younger than 24 hours so it
 cannot race an in-flight run.
@@ -168,21 +177,25 @@ actually annoys you.
 ## 5. Go worker
 
 ```
-cmd/obsync-worker/     one pull pass, exits
-cmd/obsync/            ls / preview / log / diff / cat / gc
+cmd/obsync-worker/     run (cron) / pull (manual, scoped) / courses; one pass, exits
+cmd/obsync/            ls / preview / log / diff / cat / gc / serve
 internal/portable/     path sanitisation            [pure]
 internal/policy/       rule engine                  [pure]
-internal/manifest/     schema, encode/decode        [pure]
+internal/manifest/     schema, encode/decode, diff  [pure]
 internal/plan/         the differ                   [pure]
+internal/scope/        manual pull path patterns    [pure]
 internal/canvas/       Source: pagination, limiter, downloads
-internal/store/        Store: s3 / fs / memory
+internal/store/        Store: s3 / fs / memory, logging wrapper
+internal/lease/        single-writer lease in the store
 internal/run/          orchestration, the only package that cares about ordering
+internal/gc/           unreferenced blob collection
 internal/obs/          metrics, logging
 ```
 
-The four pure packages hold every decision the system makes. Values in, values
+The pure packages hold every decision the system makes. Values in, values
 out, no context, no clock, no network. That is where the tests are and where the
-bugs will be. `run` is a thin sequencer.
+bugs will be. `run` is a thin sequencer, and the one place decisions are
+logged: the planner returns each decision with its reason as data.
 
 ### Interfaces
 
@@ -209,17 +222,53 @@ for both. Wrong for the same reason.)
 ### Run sequence
 
 ```
+0. acquire lease (not for dry runs)
 1. read manifests/<course>/latest -> run_id -> prev manifest
 2. list Canvas files + folders, build portable paths
-3. plan.Compute(prev, files, rules, overrides)
-4. for each Fetch: download -> hash -> Put blob if !Exists
+3. plan.Compute(prev, files, rules, overrides, scope)
+4. for each Fetch: download to temp file -> hash -> Put blob if !Exists
 5. assemble manifest (carry + skipped + locked + failed + tombstones + fetched)
-6. Put manifests/<course>/<run_id>.json
-7. Put manifests/<course>/latest         <- COMMIT
+6. Put manifests/<course>/<run_id>.json  (write-once)
+7. verify lease, Put manifests/<course>/latest   <- COMMIT
+8. after all courses: Put runs/<run_id>.json, release lease
 ```
 
 One failing course does not abort the others: its previous manifest stays live,
-which is the correct degraded state.
+which is the correct degraded state. Three things do stop the pass: a rejected
+token (every later request fails the same way), a lost lease, and cancellation.
+A course whose Files tab is hidden returns 403, and a scheduled run records it
+as `forbidden`, not as a failure.
+
+Hardening that follows from "nothing is silently withheld":
+
+- A filename that cannot be made portable is stored under a stand-in name
+  (`canvas-file-<id>.ext`) with the original in `reason`, not dropped.
+- A failed refresh of a previously stored file keeps the previous entry
+  verbatim, stale metadata included, so the consumer keeps the file and the
+  next run retries.
+- A download whose byte count differs from Canvas's `size` is a failure, never
+  a blob: a clean short read would otherwise become the content of record.
+- Skip decisions are re-evaluated every run. `rules_hash` records which rules
+  produced a manifest; it no longer gates re-evaluation, which let a file that
+  shrank under the size cap stay skipped forever.
+
+### Manual pulls and scope
+
+`obsync-worker pull -course CS3103 -path "Week 1" -path "**/*.pdf"` pulls on
+demand. Scope limits **downloads, never the catalogue**: listing is cheap, so
+skips, locks and tombstones stay complete. A file outside the scope keeps its
+previous entry unchanged if it had been fetched before; otherwise it is
+catalogued as `skipped` with rule `obsync:pull-scope`, and the next full pass
+fetches it. A pattern that matches nothing fails the pull, since it is almost
+always a typo. `-dry-run` plans and logs every decision and writes nothing.
+
+### Audit log
+
+Every non-trivial action is one JSON line on stderr with a stable dotted event
+name (`plan.skip`, `file.fetched`, `store.put`, `latest.published`, ...) and the
+run id, so a pass can be reconstructed from logs alone. Decisions, remote calls
+and writes log at Info; degraded outcomes at Warn; aborts at Error; no-ops at
+Debug. Tokens never appear; download verifiers are redacted.
 
 ### Path portability
 
