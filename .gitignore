@@ -30,3 +30,34 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# --- obsync ---
+
+# Secrets. .env holds a live Canvas token; so could any variant of it.
+.env.*
+!.env.example
+*.pem
+*.key
+# Unsealed Kubernetes secrets. Only SealedSecret manifests belong in git.
+*-secret.yaml
+!*sealed*-secret.yaml
+
+# Build output (make build)
+/bin/
+
+# Local dev store (worker -fs-store) and downloads staged by the worker
+/.obsync-store/
+obsync-download-*
+
+# Plugin: dependencies, build output, and settings Obsidian writes into the
+# plugin folder when it is symlinked into a vault
+plugin/node_modules/
+plugin/main.js
+plugin/data.json
+plugin/coverage/
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
