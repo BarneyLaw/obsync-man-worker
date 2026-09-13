@@ -36,15 +36,27 @@ func (l *Logged) Get(ctx context.Context, key string) (io.ReadCloser, error) {
 	return rc, err
 }
 
+// counted wraps r to measure an unknown-size stream. A known size is passed
+// through untouched: every backend enforces it, and wrapping would hide the
+// io.Seeker the S3 backend needs to sign and retry a multi-gigabyte upload
+// without spooling it to disk first.
+func counted(r io.Reader, size int64) (io.Reader, func() int64) {
+	if size >= 0 {
+		return r, func() int64 { return size }
+	}
+	cr := &countingReader{r: r}
+	return cr, func() int64 { return cr.n }
+}
+
 func (l *Logged) Put(ctx context.Context, key string, r io.Reader, size int64) error {
 	start := time.Now()
-	cr := &countingReader{r: r}
-	err := l.Inner.Put(ctx, key, cr, size)
+	body, n := counted(r, size)
+	err := l.Inner.Put(ctx, key, body, size)
 	if err != nil {
-		l.Log.Warn("store.put_failed", "key", key, "bytes", cr.n, "err", err)
+		l.Log.Warn("store.put_failed", "key", key, "err", err)
 		return err
 	}
-	l.Log.Info("store.put", "key", key, "bytes", cr.n, "duration_ms", time.Since(start).Milliseconds())
+	l.Log.Info("store.put", "key", key, "bytes", n(), "duration_ms", time.Since(start).Milliseconds())
 	return nil
 }
 
@@ -54,18 +66,34 @@ func (l *Logged) PutIfAbsent(ctx context.Context, key string, r io.Reader, size 
 		return errors.ErrUnsupported
 	}
 	start := time.Now()
-	cr := &countingReader{r: r}
-	err := ep.PutIfAbsent(ctx, key, cr, size)
+	body, n := counted(r, size)
+	err := ep.PutIfAbsent(ctx, key, body, size)
 	switch {
+	case errors.Is(err, errors.ErrUnsupported):
+		l.Log.Info("store.put_if_absent_unsupported", "key", key)
 	case errors.Is(err, ErrExists):
 		l.Log.Info("store.put_if_absent", "key", key, "created", false)
 	case err != nil:
 		l.Log.Warn("store.put_if_absent_failed", "key", key, "err", err)
 	default:
-		l.Log.Info("store.put_if_absent", "key", key, "created", true, "bytes", cr.n,
+		l.Log.Info("store.put_if_absent", "key", key, "created", true, "bytes", n(),
 			"duration_ms", time.Since(start).Milliseconds())
 	}
 	return err
+}
+
+func (l *Logged) Stat(ctx context.Context, key string) (ObjectInfo, error) {
+	st, ok := l.Inner.(Stater)
+	if !ok {
+		return ObjectInfo{}, errors.ErrUnsupported
+	}
+	info, err := st.Stat(ctx, key)
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		l.Log.Warn("store.stat_failed", "key", key, "err", err)
+	} else {
+		l.Log.Debug("store.stat", "key", key, "found", err == nil)
+	}
+	return info, err
 }
 
 func (l *Logged) Exists(ctx context.Context, key string) (bool, error) {
@@ -120,4 +148,5 @@ var (
 	_ Store           = (*Logged)(nil)
 	_ ExclusivePutter = (*Logged)(nil)
 	_ RangeReader     = (*Logged)(nil)
+	_ Stater          = (*Logged)(nil)
 )

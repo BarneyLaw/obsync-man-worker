@@ -55,6 +55,17 @@ export class RemoteStore {
   }
 
   /**
+   * Whole-object GET. Used below CHUNK_THRESHOLD, where the range bookkeeping
+   * buys nothing, and it is the only path that handles a zero-byte object:
+   * a Range of bytes=0--1 is malformed, and Canvas does serve empty files.
+   */
+  async getBinary(key: string): Promise<ArrayBuffer> {
+    const r = await this.request({ url: this.url(key), method: "GET" });
+    if (r.status >= 400) throw new Error(`obsync: GET ${key} -> ${r.status}`);
+    return r.arrayBuffer;
+  }
+
+  /**
    * Fetch [offset, offset+length) of an object.
    *
    * This is the single most load-bearing call in the plugin. requestUrl buffers
@@ -64,16 +75,33 @@ export class RemoteStore {
    *
    * Range GET is standard S3 and Garage supports it, but the entire mobile
    * story rests on it, so make it your FIRST integration test.
+   *
+   * A 206 is REQUIRED, not merely preferred. An endpoint or proxy that ignores
+   * Range answers 200 with the whole object, and accepting that would append
+   * the entire file once per chunk -- an N-times-oversized download on the
+   * device least able to afford it.
    */
   async getRange(key: string, offset: number, length: number): Promise<ArrayBuffer> {
+    if (length <= 0) return new ArrayBuffer(0);
     const end = offset + length - 1;
     const r = await this.request({
       url: this.url(key),
       method: "GET",
       headers: { Range: `bytes=${offset}-${end}` },
     });
-    if (r.status !== 206 && r.status !== 200) {
+    if (r.status !== 206) {
+      if (r.status === 200) {
+        throw new Error(
+          `obsync: range GET ${key} was answered with 200, not 206: the endpoint ` +
+          `is ignoring the Range header. Check for a proxy in front of the bucket.`,
+        );
+      }
       throw new Error(`obsync: range GET ${key} -> ${r.status}`);
+    }
+    if (r.arrayBuffer.byteLength !== length) {
+      throw new Error(
+        `obsync: range GET ${key} returned ${r.arrayBuffer.byteLength} bytes, expected ${length}`,
+      );
     }
     return r.arrayBuffer;
   }

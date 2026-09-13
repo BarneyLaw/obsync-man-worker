@@ -1,4 +1,4 @@
-.PHONY: test build lint courses run-dev pull-dev serve-dev plugin
+.PHONY: test build lint courses run-dev pull-dev serve-dev plugin plugin-test plugin-lint contract fixtures ci
 # Every recipe is one plain command, so on Windows without make you can paste
 # it into a shell directly (add .exe to the binary names).
 test:
@@ -24,3 +24,23 @@ serve-dev: build
 	./bin/obsync -fs-store=./.obsync-store serve
 plugin:
 	cd plugin && npm run build
+plugin-test:
+	cd plugin && npm test
+plugin-lint:
+	cd plugin && npm run lint
+# Rewrite the generated contract fixtures in schema/ after changing what the
+# worker writes, then run both halves against them.
+fixtures:
+	go test ./internal/manifest -run TestContractFixtures -count=1 -update
+contract:
+	go test -count=1 ./internal/manifest ./internal/policy
+	cd plugin && npx vitest run src/contract.test.ts src/preview.test.ts src/policy.test.ts
+# Local Garage for the S3 backend: eval "$(scripts/garage-dev.sh env)" afterwards.
+garage-up:
+	scripts/garage-dev.sh up
+garage-down:
+	scripts/garage-dev.sh down
+s3-test:
+	OBSYNC_REQUIRE_S3=1 go test -count=1 -v -run S3 ./internal/store ./internal/run
+# Everything both CI workflows run.
+ci: lint test plugin-lint plugin-test plugin

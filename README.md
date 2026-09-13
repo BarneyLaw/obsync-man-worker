@@ -10,15 +10,16 @@ from there into an Obsidian vault. One-way. See [DESIGN.md](DESIGN.md).
 | `internal/portable`, `policy`, `manifest`, `plan`, `scope` | done, tests green |
 | `internal/canvas` | client + rate limiter, tested against httptest; token and files API verified on NUS Canvas |
 | `internal/store` FS + Memory + logging wrapper | done |
-| `internal/store` S3 | stub, build step 5 |
-| `internal/lease` | done; exclusive on FS/Memory, S3 needs `If-None-Match` |
+| `internal/store` S3 | done; integration-tested against Garage v2.3.0 locally and in CI |
+| `internal/lease` | done; exclusive on FS/Memory; best-effort on Garage, which ignores `If-None-Match` |
 | `internal/run` | hardened, audit-logged; downloads still serial |
 | `internal/gc` | done |
 | `cmd/obsync-worker` run / pull / courses | done |
 | `cmd/obsync` ls / preview / log / diff / cat / gc / serve | done |
 | `internal/obs` | JSON audit log; Pushgateway not wired |
-| plugin: types/policy/preview | done, cross-tested against Go |
-| plugin: sync/store/UI | written, untested in a real vault |
+| plugin: types/policy/preview | done, contract-tested against the Go fixtures in `schema/` |
+| plugin: sync/store/UI | sync unit-tested against an in-memory adapter; untested in a real vault |
+| CI | `worker.yml` and `plugin.yml`, path-filtered, both on contract changes |
 
 ## Worker commands
 
@@ -112,20 +113,95 @@ go build -o bin/obsync-worker.exe ./cmd/obsync-worker; go build -o bin/obsync.ex
 ./bin/obsync.exe serve
 ```
 
+## Garage (S3) store
+
+Every command that takes `-fs-store` uses S3 instead when the flag is omitted
+and `GARAGE_*` is set: `GARAGE_ENDPOINT`, `GARAGE_BUCKET`, `GARAGE_ACCESS_KEY`,
+`GARAGE_SECRET_KEY`, optionally `GARAGE_REGION` (default `garage`). These are
+the variables the CronJob already sets.
+
+A single-node Garage in Docker for development, the same one CI uses:
+
+```sh
+scripts/garage-dev.sh up             # container obsync-garage: bucket obsync, key obsync-dev
+eval "$(scripts/garage-dev.sh env)"
+make s3-test                         # Range GET, conformance, presign, a full worker pass
+./bin/obsync-worker pull -course CS3103 -path Labs -rules deploy/rules.json
+./bin/obsync ls
+./bin/obsync serve                   # read-only proxy in front of Garage
+scripts/garage-dev.sh down           # removes the container and its data
+```
+
+From PowerShell, after `up` has run once in Git Bash:
+`& "$env:ProgramFiles\Git\bin\bash.exe" scripts/garage-dev.sh env --ps | Out-String | Invoke-Expression`
+
+**Pointing the plugin at Garage.** The S3 API needs signed requests and the
+plugin holds no credentials, so it reads through one of two unsigned doors:
+
+| | `obsync serve` in front of Garage | Garage's website endpoint |
+|---|---|---|
+| Store URL | `http://127.0.0.1:8765` | `http://obsync.web.garage.localhost:3902` in dev, a Tailscale name in the cluster |
+| Bucket setting | `obsync` or empty | empty (the host name selects the bucket) |
+| Credentials | on the machine running `serve`; a read-only key is enough | none |
+| Exposes | only `manifests/` and `blobs/` | every key, including `locks/` and `runs/` |
+| Range | yes (206) | yes (206) |
+
+**Single writer on Garage.** Garage v2.3.0 accepts a second `PutObject` with
+`If-None-Match: *` instead of refusing it (`TestS3ConditionalWrites` records
+this, and the store probes it at runtime). So on Garage the lease is
+best-effort: the worker logs `lease.best_effort`, and re-verifies the lease
+straight after taking it and before every commit. Scheduled runs are still kept
+single by the CronJob's `concurrencyPolicy: Forbid`, so run manual pulls away
+from the `:17` schedule. If a later Garage honours the header, the probe picks
+it up with no code change.
+
 ## Plugin
 
 ```sh
 cd plugin
-npm install
-npm test                     # cross-checks the rule engine against the Go golden fixture
-npm run dev                  # esbuild watch
+npm ci
+npm test                     # vitest, including the contract fixtures in ../schema
+npm run lint
+npm run dev                  # esbuild watch into main.js
 ln -s $PWD ~/ObsidianDev/.obsidian/plugins/obsync
 ```
 
 On Windows, link with a junction instead:
 `cmd /c mklink /J "%USERPROFILE%\ObsidianDev\.obsidian\plugins\obsync" "%CD%"`.
 
+Point it at a dev store: run `obsync serve`, then in the plugin's Setup set
+**Store URL** to `http://127.0.0.1:8765`, leave **Bucket** as `obsync` (or
+empty; `serve` accepts both), and put the numeric id from `obsync ls` in
+**Course IDs**.
+
 Requires Obsidian >= 1.12.3 for `appendBinary`.
+
+## The worker/plugin contract and CI
+
+The worker and the plugin ship as a pair, so the contract between them is
+checked from both sides against the same files in `schema/`:
+
+| File | Written by | Checked by |
+|---|---|---|
+| `policy-golden.json` | hand | Go `internal/policy`, plugin `policy.test.ts` |
+| `manifest-golden.json` | `go test ./internal/manifest -run TestContractFixtures -update` | Go (byte-for-byte), plugin `contract.test.ts`, `preview.test.ts` |
+| `store-contract.json` | same command | Go, plugin `contract.test.ts` |
+| `manifest-invalid.json` | hand | Go `Decode`, plugin `parseManifest` |
+
+Never edit a generated fixture by hand; never copy any of them into `plugin/`.
+
+CI is two workflows in `.github/workflows/`:
+
+| Workflow | Runs when these change | Does |
+|---|---|---|
+| `worker.yml` | `cmd/`, `internal/`, `go.mod`, `go.sum`, `deploy/rules.json` | tidy, gofmt, vet, race tests, fixture regeneration diff, build, cross-compile, smoke |
+| `plugin.yml` | `plugin/` (not Markdown) | `npm ci`, lint, tests, type-check and bundle on Node 22 and 24, release metadata, bundle artifact |
+| **both** | `schema/`, `internal/manifest`, `internal/policy`, `internal/plan`, `cmd/obsync`, and the plugin's `types`, `policy`, `preview`, `store`, `sync` and tests | cross-check each half against the same contract |
+
+The contract path list is identical in both files; change them together. Each
+runs on pushes to `main`, on pull requests, and manually. Because of the path
+filters, a workflow that does not apply to a PR never reports, so do not make
+either one a blanket required check.
 
 ## Before you start
 

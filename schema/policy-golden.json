@@ -1,28 +1,241 @@
 {
-  "_comment": "Shared contract between internal/policy (Go) and plugin/src/policy.ts. Both test suites load this file. Change the engine, change this, run both.",
+  "_comment": [
+    "THE contract between internal/policy (Go) and plugin/src/policy.ts (TypeScript).",
+    "Both test suites read this one file and must agree on every entry. If they",
+    "diverge, the plugin shows a preview that does not match what the worker did.",
+    "",
+    "cases:   both engines must reach `want` through `want_rule` (\"\" = default).",
+    "invalid: both validators must reject the policy (Go policy.Parse, TS validate).",
+    "",
+    "Change an engine, change this file, run both suites. Never fork it."
+  ],
   "policy": {
     "version": 1,
     "default": "include",
     "rules": [
-      { "name": "no-video", "priority": 10, "action": "skip",
-        "match": { "ext": ["mp4", "mkv", "mov", "avi", "webm"] } },
-      { "name": "hard-size-cap", "priority": 10, "action": "skip",
-        "match": { "min_size": 2147483648 } },
-      { "name": "keep-slides", "priority": 100, "action": "include",
-        "match": { "ext": ["pdf", "pptx"] } },
-      { "name": "drop-solutions", "priority": 50, "action": "skip",
-        "match": { "glob": ["*/solutions/*"] } }
+      { "name": "no-tiny", "priority": 5, "action": "skip", "match": { "max_size": 10 } },
+      { "name": "no-huge", "priority": 10, "action": "skip", "match": { "min_size": 52428800 } },
+      { "name": "no-video", "priority": 20, "action": "skip", "match": { "ext": ["mp4", "mov", "mkv", ".webm"] } },
+      { "name": "drafts", "priority": 25, "action": "skip", "match": { "glob": ["draft[0-9].pdf"] } },
+      { "name": "solutions", "priority": 30, "action": "skip", "match": { "glob": ["*/solutions/*"] } },
+      {
+        "name": "always-slides",
+        "priority": 40,
+        "action": "include",
+        "match": { "ext": ["pdf"], "glob": ["*/lectures/*"] }
+      },
+      { "name": "other-course", "priority": 50, "action": "skip", "match": { "course_ids": [999] } },
+      { "name": "tie-first", "priority": 60, "action": "skip", "match": { "glob": ["tie/*"] } },
+      { "name": "tie-second", "priority": 60, "action": "include", "match": { "glob": ["tie/*"] } }
     ]
   },
   "cases": [
-    { "candidate": { "Path": "notes.md", "Size": 1024, "MIME": "text/markdown", "CourseID": 1 }, "want": "include", "want_rule": "" },
-    { "candidate": { "Path": "w1/lecture.mp4", "Size": 104857600, "MIME": "video/mp4", "CourseID": 1 }, "want": "skip", "want_rule": "no-video" },
-    { "candidate": { "Path": "w1/lecture.MP4", "Size": 104857600, "MIME": "video/mp4", "CourseID": 1 }, "want": "skip", "want_rule": "no-video" },
-    { "candidate": { "Path": "big.zip", "Size": 3221225472, "MIME": "application/zip", "CourseID": 1 }, "want": "skip", "want_rule": "hard-size-cap" },
-    { "candidate": { "Path": "textbook.pdf", "Size": 3221225472, "MIME": "application/pdf", "CourseID": 1 }, "want": "include", "want_rule": "keep-slides" },
-    { "candidate": { "Path": "cs/solutions/a.docx", "Size": 2048, "MIME": "", "CourseID": 1 }, "want": "skip", "want_rule": "drop-solutions" },
-    { "candidate": { "Path": "cs/solutions/a.pdf", "Size": 2048, "MIME": "", "CourseID": 1 }, "want": "include", "want_rule": "keep-slides" },
-    { "candidate": { "Path": "LICENSE", "Size": 10, "MIME": "", "CourseID": 1 }, "want": "include", "want_rule": "" },
-    { "candidate": { "Path": ".gitignore", "Size": 10, "MIME": "", "CourseID": 1 }, "want": "include", "want_rule": "" }
+    {
+      "_why": "nothing matches, so the default decides",
+      "candidate": { "Path": "notes.pdf", "Size": 1000, "CourseID": 1 },
+      "want": "include",
+      "want_rule": ""
+    },
+    {
+      "_why": "min_size is inclusive-at-or-above",
+      "candidate": { "Path": "big.pdf", "Size": 104857600, "CourseID": 1 },
+      "want": "skip",
+      "want_rule": "no-huge"
+    },
+    {
+      "_why": "min_size boundary: exactly the cap is skipped",
+      "candidate": { "Path": "exact.pdf", "Size": 52428800, "CourseID": 1 },
+      "want": "skip",
+      "want_rule": "no-huge"
+    },
+    {
+      "_why": "max_size caps from below",
+      "candidate": { "Path": "stub.txt", "Size": 5, "CourseID": 1 },
+      "want": "skip",
+      "want_rule": "no-tiny"
+    },
+    {
+      "_why": "max_size boundary: exactly the cap is skipped",
+      "candidate": { "Path": "ten.txt", "Size": 10, "CourseID": 1 },
+      "want": "skip",
+      "want_rule": "no-tiny"
+    },
+    {
+      "_why": "max_size boundary: one byte over is not",
+      "candidate": { "Path": "eleven.txt", "Size": 11, "CourseID": 1 },
+      "want": "include",
+      "want_rule": ""
+    },
+    {
+      "_why": "extension match",
+      "candidate": { "Path": "lecture.mp4", "Size": 1000, "CourseID": 1 },
+      "want": "skip",
+      "want_rule": "no-video"
+    },
+    {
+      "_why": "extension match is case-insensitive",
+      "candidate": { "Path": "LECTURE.MP4", "Size": 1000, "CourseID": 1 },
+      "want": "skip",
+      "want_rule": "no-video"
+    },
+    {
+      "_why": "extension match looks only at the file name, in any directory",
+      "candidate": { "Path": "w1/Lecture.Mp4", "Size": 1000, "CourseID": 1 },
+      "want": "skip",
+      "want_rule": "no-video"
+    },
+    {
+      "_why": "a leading dot in a rule's extension is ignored",
+      "candidate": { "Path": "clip.WEBM", "Size": 1000, "CourseID": 1 },
+      "want": "skip",
+      "want_rule": "no-video"
+    },
+    {
+      "_why": "glob star matches one path segment",
+      "candidate": { "Path": "cs/solutions/a.pdf", "Size": 1000, "CourseID": 1 },
+      "want": "skip",
+      "want_rule": "solutions"
+    },
+    {
+      "_why": "THE path-semantics case: star must not cross a separator",
+      "candidate": { "Path": "cs/x/solutions/a.pdf", "Size": 1000, "CourseID": 1 },
+      "want": "include",
+      "want_rule": ""
+    },
+    {
+      "_why": "character class, as in Go's path.Match",
+      "candidate": { "Path": "draft3.pdf", "Size": 1000, "CourseID": 1 },
+      "want": "skip",
+      "want_rule": "drafts"
+    },
+    {
+      "_why": "character class does not match outside its range",
+      "candidate": { "Path": "draftX.pdf", "Size": 1000, "CourseID": 1 },
+      "want": "include",
+      "want_rule": ""
+    },
+    {
+      "_why": "every clause of a match must hold: ext and glob together",
+      "candidate": { "Path": "cs/lectures/w1.pdf", "Size": 1000, "CourseID": 1 },
+      "want": "include",
+      "want_rule": "always-slides"
+    },
+    {
+      "_why": "higher priority beats a hard cap: an include can rescue a big file",
+      "candidate": { "Path": "cs/lectures/big.pdf", "Size": 104857600, "CourseID": 1 },
+      "want": "include",
+      "want_rule": "always-slides"
+    },
+    {
+      "_why": "course_ids scoping",
+      "candidate": { "Path": "notes.pdf", "Size": 1000, "CourseID": 999 },
+      "want": "skip",
+      "want_rule": "other-course"
+    },
+    {
+      "_why": "a course-scoped skip outranks a lower-priority include in that course",
+      "candidate": { "Path": "cs/lectures/w1.pdf", "Size": 1000, "CourseID": 999 },
+      "want": "skip",
+      "want_rule": "other-course"
+    },
+    {
+      "_why": "equal priority breaks by document order, top to bottom",
+      "candidate": { "Path": "tie/a.pdf", "Size": 1000, "CourseID": 1 },
+      "want": "skip",
+      "want_rule": "tie-first"
+    },
+    {
+      "_why": "a file with no extension has no ext to match",
+      "candidate": { "Path": "README", "Size": 1000, "CourseID": 1 },
+      "want": "include",
+      "want_rule": ""
+    },
+    {
+      "_why": "a dotfile's leading dot is not an extension",
+      "candidate": { "Path": ".gitignore", "Size": 1000, "CourseID": 1 },
+      "want": "include",
+      "want_rule": ""
+    },
+    {
+      "_why": "dots in parent directories are not an extension",
+      "candidate": { "Path": "v1.2/README", "Size": 1000, "CourseID": 1 },
+      "want": "include",
+      "want_rule": ""
+    }
+  ],
+  "invalid": [
+    {
+      "_why": "unknown match key: a typo would silently broaden the rule",
+      "policy": { "version": 1, "default": "include", "rules": [
+        { "name": "cap", "priority": 1, "action": "skip", "match": { "ext": ["mp4"], "max_szie": 10 } }
+      ] }
+    },
+    {
+      "_why": "unknown top-level key",
+      "policy": { "version": 1, "default": "include", "defualt": "skip", "rules": [] }
+    },
+    {
+      "_why": "unknown rule key",
+      "policy": { "version": 1, "default": "include", "rules": [
+        { "name": "cap", "priority": 1, "action": "skip", "match": { "ext": ["mp4"] }, "enabled": false }
+      ] }
+    },
+    {
+      "_why": "an empty match matches everything, which is what default is for",
+      "policy": { "version": 1, "default": "include", "rules": [
+        { "name": "all", "priority": 1, "action": "skip", "match": {} }
+      ] }
+    },
+    {
+      "_why": "duplicate rule names make skip reasons ambiguous",
+      "policy": { "version": 1, "default": "include", "rules": [
+        { "name": "dup", "priority": 1, "action": "skip", "match": { "ext": ["a"] } },
+        { "name": "dup", "priority": 2, "action": "skip", "match": { "ext": ["b"] } }
+      ] }
+    },
+    {
+      "_why": "every rule needs a name",
+      "policy": { "version": 1, "default": "include", "rules": [
+        { "name": "", "priority": 1, "action": "skip", "match": { "ext": ["mp4"] } }
+      ] }
+    },
+    {
+      "_why": "action must be include or skip",
+      "policy": { "version": 1, "default": "include", "rules": [
+        { "name": "r", "priority": 1, "action": "delete", "match": { "ext": ["mp4"] } }
+      ] }
+    },
+    {
+      "_why": "default must be include or skip",
+      "policy": { "version": 1, "default": "maybe", "rules": [] }
+    },
+    {
+      "_why": "unsupported version",
+      "policy": { "version": 2, "default": "include", "rules": [] }
+    },
+    {
+      "_why": "malformed glob, Go's ErrBadPattern",
+      "policy": { "version": 1, "default": "include", "rules": [
+        { "name": "r", "priority": 1, "action": "skip", "match": { "glob": ["[abc"] } }
+      ] }
+    },
+    {
+      "_why": "priority must be an integer",
+      "policy": { "version": 1, "default": "include", "rules": [
+        { "name": "r", "priority": 1.5, "action": "skip", "match": { "ext": ["mp4"] } }
+      ] }
+    },
+    {
+      "_why": "ext must be a list of strings, not a string",
+      "policy": { "version": 1, "default": "include", "rules": [
+        { "name": "r", "priority": 1, "action": "skip", "match": { "ext": "mp4" } }
+      ] }
+    },
+    {
+      "_why": "sizes must be numbers",
+      "policy": { "version": 1, "default": "include", "rules": [
+        { "name": "r", "priority": 1, "action": "skip", "match": { "min_size": "50MB" } }
+      ] }
+    }
   ]
 }

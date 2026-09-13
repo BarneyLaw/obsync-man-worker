@@ -1,9 +1,9 @@
 import { Plugin, Notice, normalizePath } from "obsidian";
-import { sha256 } from "@noble/hashes/sha256";
-import { bytesToHex } from "@noble/hashes/utils";
+import { sha256 } from "@noble/hashes/sha2.js";
+import { bytesToHex } from "@noble/hashes/utils.js";
 import { Manifest, Entry, blobKey, latestKey, manifestKey, parseManifest } from "./types";
 import { Policy } from "./policy";
-import { LocalState, saveState } from "./state";
+import { FileRecord, LocalState, saveState } from "./state";
 import { RemoteStore, chunkSize, CHUNK_THRESHOLD } from "./store";
 import { preview, Preview } from "./preview";
 
@@ -14,6 +14,17 @@ export interface SyncResult {
   conflicts: string[];
   skipped: number;
   errors: string[];
+  /** Files already on disk with the right bytes; adopted without a download. */
+  adopted: number;
+}
+
+/** Outcome of a single entry write. */
+type WriteOutcome = "written" | "conflict" | "adopted";
+
+export interface SyncFolders {
+  targetFolder: string;
+  trashFolder: string;
+  conflictFolder: string;
 }
 
 /**
@@ -29,24 +40,42 @@ export class Syncer {
     private store: RemoteStore,
     private policy: Policy,
     private state: LocalState,
-    private settings: { targetFolder: string; trashFolder: string; conflictFolder: string },
+    private settings: SyncFolders,
   ) {}
 
   async fetchManifest(courseId: number): Promise<Manifest | null> {
-    const runId = await this.store.getText(latestKey(courseId));
-    if (!runId) return null;
-    const raw = await this.store.getText(manifestKey(courseId, runId.trim()));
+    const latest = await this.store.getText(latestKey(courseId));
+    if (!latest) return null;
+    const runId = latest.trim();
+    const key = manifestKey(courseId, runId);
+    const raw = await this.store.getText(key);
     if (!raw) return null;
-    return parseManifest(raw);
+    const m = parseManifest(raw);
+    // The worker's own reader checks this too. A manifest naming another
+    // course or run is a mis-served or hand-copied object, and syncing it
+    // would tombstone the wrong course's files.
+    if (m.course_id !== courseId || m.run_id !== runId) {
+      throw new Error(`obsync: ${key} claims course ${m.course_id} run ${m.run_id}`);
+    }
+    return m;
   }
 
   previewCourse(m: Manifest): Preview {
     return preview(m, this.policy, this.state);
   }
 
+  /**
+   * @param only - when present, restricts the pull to these paths. A partial
+   *   pull deliberately does NOT advance lastRunId and does NOT process
+   *   tombstones: the run is not finished, and claiming otherwise would make
+   *   pullAll skip the course and strand every unselected file.
+   */
   async syncCourse(m: Manifest, only?: Set<string>): Promise<SyncResult> {
-    const res: SyncResult = { added: 0, updated: 0, removed: 0, conflicts: [], skipped: 0, errors: [] };
+    const res: SyncResult = {
+      added: 0, updated: 0, removed: 0, conflicts: [], skipped: 0, errors: [], adopted: 0,
+    };
     const p = this.previewCourse(m);
+    const partial = only !== undefined;
 
     for (const item of p.items) {
       if (only && !only.has(item.entry.path)) continue;
@@ -54,8 +83,9 @@ export class Syncer {
         switch (item.action) {
           case "download":
           case "update": {
-            const conflicted = await this.writeEntry(item.entry);
-            if (conflicted) res.conflicts.push(item.entry.path);
+            const outcome = await this.writeEntry(item.entry);
+            if (outcome === "conflict") res.conflicts.push(item.entry.path);
+            else if (outcome === "adopted") res.adopted++;
             else if (item.action === "download") res.added++;
             else res.updated++;
             break;
@@ -68,107 +98,193 @@ export class Syncer {
       }
     }
 
-    for (const e of m.entries) {
-      if (e.state === "deleted" && this.state.files[e.path]) {
-        await this.trash(e.path);
-        res.removed++;
+    if (!partial) {
+      for (const e of m.entries) {
+        if (e.state === "deleted" && this.state.files[e.path]) {
+          try {
+            await this.trash(e.path);
+            res.removed++;
+          } catch (err) {
+            res.errors.push(`${e.path}: ${String(err)}`);
+          }
+        }
       }
+      // Only a complete pass may claim the run. Marking a partial pull as done
+      // would trip the "nothing new since last look" guard in pullAll.
+      this.state.lastRunId[String(m.course_id)] = m.run_id;
     }
 
-    this.state.lastRunId[String(m.course_id)] = m.run_id;
     await saveState(this.plugin, this.state, this.settings);
     return res;
   }
 
-  /** @returns true if the write was diverted to a conflict quarantine. */
-  private async writeEntry(e: Entry): Promise<boolean> {
+  private async writeEntry(e: Entry): Promise<WriteOutcome> {
     if (!e.sha256) throw new Error("stored entry without a hash");
     const adapter = this.plugin.app.vault.adapter;
     const dest = normalizePath(`${this.settings.targetFolder}/${e.path}`);
-
-    // One-way sync is NOT a licence to destroy local data. If what is on disk
-    // does not match the hash we last wrote, the user edited a read-only file:
-    // quarantine it and move on.
     const known = this.state.files[e.path];
-    if (known && (await adapter.exists(dest))) {
-      const onDisk = bytesToHex(sha256(new Uint8Array(await adapter.readBinary(dest))));
-      if (onDisk !== known.sha256) {
-        const q = normalizePath(`${this.settings.conflictFolder}/${e.path}`);
-        await this.ensureDir(q);
-        await adapter.rename(dest, q);
-        return true;
+
+    // One-way sync is NOT a licence to destroy local data.
+    //
+    // The check is on the FILE, not on whether we have a record of it. A vault
+    // synced to a second device arrives with files on disk and an empty
+    // data.json, so gating this on `known` would let the first sync on a new
+    // device silently overwrite the user's edits.
+    if (await adapter.exists(dest)) {
+      const onDisk = await this.hashFile(dest, known);
+      if (onDisk === e.sha256) {
+        // Right bytes already there (second device, or a restored backup).
+        // Adopt it instead of re-downloading.
+        this.state.files[e.path] = { sha256: e.sha256, size: e.size, writtenAt: Date.now() };
+        return "adopted";
+      }
+      if (onDisk !== known?.sha256) {
+        // Either we have no record of this file, or it no longer matches what
+        // we last wrote. Both mean the bytes are not ours to overwrite.
+        await this.quarantine(dest, e.path);
+        return "conflict";
       }
     }
 
-    await this.ensureDir(dest);
     // Part file lives in the plugin folder and is dot-prefixed so Obsidian
     // never indexes a half-written PDF and the user never sees it flicker.
-    const part = normalizePath(
-      `${this.plugin.manifest.dir}/.parts/${e.sha256}.part`,
-    );
+    const part = normalizePath(`${this.partsDir()}/${e.sha256}.part`);
     await this.ensureDir(part);
     if (await adapter.exists(part)) await adapter.remove(part);
 
     const key = blobKey(e.sha256);
     const hasher = sha256.create();
 
-    if (e.size <= CHUNK_THRESHOLD) {
-      const buf = await this.store.getRange(key, 0, e.size);
-      hasher.update(new Uint8Array(buf));
-      await adapter.writeBinary(part, buf);
-    } else {
-      const cs = chunkSize();
-      for (let off = 0; off < e.size; off += cs) {
-        const n = Math.min(cs, e.size - off);
-        const buf = await this.store.getRange(key, off, n);
+    try {
+      if (e.size <= CHUNK_THRESHOLD) {
+        // Plain GET: no Range arithmetic, and it is the only path that copes
+        // with a zero-byte object.
+        const buf = await this.store.getBinary(key);
         hasher.update(new Uint8Array(buf));
-        // appendBinary landed in Obsidian 1.12.3 and is why the mobile size
-        // ceiling stopped being structural. CapacitorAdapter implements
-        // DataAdapter, so this works on phones too.
-        await adapter.appendBinary(part, buf);
-        // Record progress so an interrupted pull resumes instead of restarting.
-        this.state.files[e.path] = {
-          sha256: "", size: e.size, writtenAt: Date.now(), partialOffset: off + n,
-        };
+        await adapter.writeBinary(part, buf);
+      } else {
+        const cs = chunkSize();
+        for (let off = 0; off < e.size; off += cs) {
+          const n = Math.min(cs, e.size - off);
+          const buf = await this.store.getRange(key, off, n);
+          hasher.update(new Uint8Array(buf));
+          // appendBinary landed in Obsidian 1.12.3 and is why the mobile size
+          // ceiling stopped being structural. CapacitorAdapter implements
+          // DataAdapter, so this works on phones too.
+          await adapter.appendBinary(part, buf);
+        }
       }
+
+      // Verify before the rename. Costs nothing (the bytes already passed
+      // through the hasher) and is the only check that the store gave us what
+      // we asked for.
+      const got = bytesToHex(hasher.digest());
+      if (got !== e.sha256) {
+        throw new Error(`hash mismatch: expected ${e.sha256.slice(0, 12)} got ${got.slice(0, 12)}`);
+      }
+    } catch (err) {
+      // Never leave a partial file behind: it is keyed by the expected hash, so
+      // a stale one would otherwise sit in .parts forever.
+      if (await adapter.exists(part)) await adapter.remove(part);
+      throw err;
     }
 
-    // Verify before the rename. Costs nothing (the bytes already passed through
-    // the hasher) and is the only check that the store gave us what we asked
-    // for.
-    const got = bytesToHex(hasher.digest());
-    if (got !== e.sha256) {
-      await adapter.remove(part);
-      throw new Error(`hash mismatch: expected ${e.sha256.slice(0, 12)} got ${got.slice(0, 12)}`);
-    }
-
+    await this.ensureDir(dest);
     if (await adapter.exists(dest)) await adapter.remove(dest);
     await adapter.rename(part, dest);
     this.state.files[e.path] = { sha256: e.sha256, size: e.size, writtenAt: Date.now() };
-    return false;
+    return "written";
+  }
+
+  /**
+   * Hash of the file on disk, with a stat fast path.
+   *
+   * Reading a file back costs one whole-file buffer, which is exactly what the
+   * chunked download path exists to avoid. So when size and mtime still match
+   * what we recorded at write time, take that as untouched rather than pulling
+   * a 300 MB recording into memory on a phone every sync.
+   */
+  private async hashFile(path: string, known?: FileRecord): Promise<string> {
+    const adapter = this.plugin.app.vault.adapter;
+    if (known) {
+      const st = await adapter.stat(path);
+      // 5s of slack: mtime is stamped by the adapter just before writtenAt.
+      if (st && st.size === known.size && st.mtime <= known.writtenAt + 5000) {
+        return known.sha256;
+      }
+    }
+    return bytesToHex(sha256(new Uint8Array(await adapter.readBinary(path))));
+  }
+
+  /** Move a locally-modified file aside rather than clobbering it. */
+  private async quarantine(src: string, relPath: string) {
+    const adapter = this.plugin.app.vault.adapter;
+    let q = normalizePath(`${this.settings.conflictFolder}/${relPath}`);
+    if (await adapter.exists(q)) q = uniquify(q, Date.now());
+    await this.ensureDir(q);
+    await adapter.rename(src, q);
   }
 
   /** Never hard delete. Lecturers unpublish and republish constantly. */
   private async trash(path: string) {
     const adapter = this.plugin.app.vault.adapter;
     const src = normalizePath(`${this.settings.targetFolder}/${path}`);
-    if (!(await adapter.exists(src))) return;
-    const dst = normalizePath(`${this.settings.trashFolder}/${path}`);
+    if (!(await adapter.exists(src))) {
+      delete this.state.files[path];
+      return;
+    }
+    let dst = normalizePath(`${this.settings.trashFolder}/${path}`);
+    if (await adapter.exists(dst)) dst = uniquify(dst, Date.now());
     await this.ensureDir(dst);
     await adapter.rename(src, dst);
     delete this.state.files[path];
   }
 
+  /** `.obsidian/plugins/<id>/.parts`, with a fallback: manifest.dir is optional. */
+  private partsDir(): string {
+    const dir = this.plugin.manifest.dir
+      ?? `${this.plugin.app.vault.configDir}/plugins/${this.plugin.manifest.id}`;
+    return `${dir}/.parts`;
+  }
+
+  /**
+   * Create every missing parent of a file path.
+   *
+   * DataAdapter.mkdir creates ONE directory; it is not documented as recursive
+   * and CapacitorAdapter wraps a call that needs an explicit recursive flag.
+   * Canvas paths are nested ("Week 1/Lecture 2/slides.pdf"), so walk it.
+   */
   private async ensureDir(filePath: string) {
+    const adapter = this.plugin.app.vault.adapter;
     const dir = filePath.slice(0, filePath.lastIndexOf("/"));
-    if (dir && !(await this.plugin.app.vault.adapter.exists(dir))) {
-      await this.plugin.app.vault.adapter.mkdir(dir);
+    if (!dir) return;
+    const parts = dir.split("/").filter((s) => s.length > 0);
+    let cur = "";
+    for (const seg of parts) {
+      cur = cur ? `${cur}/${seg}` : seg;
+      if (!(await adapter.exists(cur))) {
+        try {
+          await adapter.mkdir(cur);
+        } catch {
+          // Racing another mkdir of the same path is fine; a real failure will
+          // surface on the write that follows.
+        }
+      }
     }
   }
 }
 
+/** "a/b.pdf" + 123 -> "a/b (123).pdf". Keeps the extension where users expect it. */
+export function uniquify(path: string, n: number): string {
+  const slash = path.lastIndexOf("/");
+  const dot = path.lastIndexOf(".");
+  if (dot > slash + 1) return `${path.slice(0, dot)} (${n})${path.slice(dot)}`;
+  return `${path} (${n})`;
+}
+
 export function notifyResult(r: SyncResult) {
   const parts = [`${r.added} new`, `${r.updated} updated`, `${r.removed} removed`];
+  if (r.adopted) parts.push(`${r.adopted} already present`);
   if (r.conflicts.length) parts.push(`${r.conflicts.length} conflicts`);
   if (r.errors.length) parts.push(`${r.errors.length} errors`);
   new Notice(`obsync: ${parts.join(", ")}`);

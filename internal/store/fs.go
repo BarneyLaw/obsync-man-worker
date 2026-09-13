@@ -155,6 +155,22 @@ func (f *FS) Exists(_ context.Context, key string) (bool, error) {
 	return err == nil, err
 }
 
+// Stat reports only objects: a directory is not an object, so it is not found.
+func (f *FS) Stat(_ context.Context, key string) (ObjectInfo, error) {
+	p, err := f.Path(key)
+	if err != nil {
+		return ObjectInfo{}, err
+	}
+	info, err := os.Stat(p)
+	if os.IsNotExist(err) || (err == nil && info.IsDir()) {
+		return ObjectInfo{}, ErrNotFound
+	}
+	if err != nil {
+		return ObjectInfo{}, err
+	}
+	return ObjectInfo{Key: key, Size: info.Size(), Modified: info.ModTime()}, nil
+}
+
 func (f *FS) Delete(_ context.Context, key string) error {
 	p, err := f.Path(key)
 	if err != nil {

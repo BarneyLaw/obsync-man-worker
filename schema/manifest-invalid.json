@@ -1,0 +1,76 @@
+{
+  "_comment": [
+    "Manifests both halves must refuse: internal/manifest Decode (Go) and",
+    "parseManifest in plugin/src/types.ts. Hand-written; add a case whenever",
+    "either side learns to reject something new."
+  ],
+  "cases": [
+    {
+      "_why": "schema version from the future",
+      "manifest": { "schema_version": 2, "course_id": 1, "run_id": "r", "entries": [] }
+    },
+    {
+      "_why": "no schema version",
+      "manifest": { "course_id": 1, "run_id": "r", "entries": [] }
+    },
+    {
+      "_why": "schema version is not a number",
+      "manifest": { "schema_version": "1", "course_id": 1, "run_id": "r", "entries": [] }
+    },
+    {
+      "_why": "empty run id",
+      "manifest": { "schema_version": 1, "course_id": 1, "run_id": "", "entries": [] }
+    },
+    {
+      "_why": "entries missing: would read as Canvas having nothing and tombstone the vault",
+      "manifest": { "schema_version": 1, "course_id": 1, "run_id": "r" }
+    },
+    {
+      "_why": "entries is not a list",
+      "manifest": { "schema_version": 1, "course_id": 1, "run_id": "r", "entries": {} }
+    },
+    {
+      "_why": "entry with an empty path",
+      "manifest": { "schema_version": 1, "course_id": 1, "run_id": "r", "entries": [
+        { "path": "", "state": "skipped", "reason": "x" }
+      ] }
+    },
+    {
+      "_why": "duplicate path",
+      "manifest": { "schema_version": 1, "course_id": 1, "run_id": "r", "entries": [
+        { "path": "a.pdf", "state": "stored", "sha256": "aa" },
+        { "path": "a.pdf", "state": "stored", "sha256": "bb" }
+      ] }
+    },
+    {
+      "_why": "unknown state",
+      "manifest": { "schema_version": 1, "course_id": 1, "run_id": "r", "entries": [
+        { "path": "a.pdf", "state": "archived" }
+      ] }
+    },
+    {
+      "_why": "stored without a hash: nothing to fetch or verify",
+      "manifest": { "schema_version": 1, "course_id": 1, "run_id": "r", "entries": [
+        { "path": "a.pdf", "state": "stored" }
+      ] }
+    },
+    {
+      "_why": "a hash on an entry that is not stored",
+      "manifest": { "schema_version": 1, "course_id": 1, "run_id": "r", "entries": [
+        { "path": "a.pdf", "state": "skipped", "sha256": "aa", "reason": "x" }
+      ] }
+    },
+    {
+      "_why": "skipped without a reason: the UI has nothing to show",
+      "manifest": { "schema_version": 1, "course_id": 1, "run_id": "r", "entries": [
+        { "path": "a.mp4", "state": "skipped" }
+      ] }
+    },
+    {
+      "_why": "failed without a reason",
+      "manifest": { "schema_version": 1, "course_id": 1, "run_id": "r", "entries": [
+        { "path": "a.pdf", "state": "failed" }
+      ] }
+    }
+  ]
+}

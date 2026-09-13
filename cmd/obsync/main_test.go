@@ -28,7 +28,9 @@ func serveFixture(t *testing.T) *httptest.Server {
 			t.Fatal(err)
 		}
 	}
-	srv := httptest.NewServer(&storeHandler{fs: fsStore, log: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	srv := httptest.NewServer(&storeHandler{
+		st: fsStore, log: slog.New(slog.NewTextHandler(io.Discard, nil)), bucket: "obsync",
+	})
 	t.Cleanup(srv.Close)
 	return srv
 }
@@ -57,6 +59,38 @@ func TestServeReadsKeys(t *testing.T) {
 	resp, _ = get(t, srv, "GET", "/manifests/1/r1.json", nil)
 	if resp.StatusCode != 200 || !strings.Contains(resp.Header.Get("Cache-Control"), "immutable") {
 		t.Fatalf("manifest: %d %q", resp.StatusCode, resp.Header.Get("Cache-Control"))
+	}
+}
+
+// The plugin's default Bucket setting is "obsync", so it requests
+// {base}/obsync/{key}. Both URL shapes must reach the same object.
+func TestServeAcceptsBucketPrefix(t *testing.T) {
+	srv := serveFixture(t)
+	resp, body := get(t, srv, "GET", "/obsync/manifests/1/latest", nil)
+	if resp.StatusCode != 200 || body != "r1" {
+		t.Fatalf("bucket-prefixed latest: %d %q", resp.StatusCode, body)
+	}
+	resp, body = get(t, srv, "GET", "/obsync/blobs/sha256/ab/cd/abcd", map[string]string{"Range": "bytes=0-1"})
+	if resp.StatusCode != http.StatusPartialContent || body != "01" {
+		t.Fatalf("bucket-prefixed range: %d %q", resp.StatusCode, body)
+	}
+	for _, p := range []string{"/obsync/locks/worker.json", "/other/manifests/1/latest", "/obsync/"} {
+		if resp, _ := get(t, srv, "GET", p, nil); resp.StatusCode != http.StatusNotFound {
+			t.Errorf("GET %s = %d, want 404", p, resp.StatusCode)
+		}
+	}
+}
+
+// Multi-range requests seek more than once; each range must come back exact.
+func TestServeMultiRange(t *testing.T) {
+	srv := serveFixture(t)
+	resp, body := get(t, srv, "GET", "/blobs/sha256/ab/cd/abcd", map[string]string{"Range": "bytes=0-1,7-9"})
+	if resp.StatusCode != http.StatusPartialContent || !strings.Contains(body, "01") || !strings.Contains(body, "789") {
+		t.Fatalf("multi-range: %d %q", resp.StatusCode, body)
+	}
+	resp, body = get(t, srv, "HEAD", "/blobs/sha256/ab/cd/abcd", nil)
+	if resp.StatusCode != 200 || body != "" || resp.ContentLength != 10 {
+		t.Fatalf("HEAD: %d len=%d body=%q", resp.StatusCode, resp.ContentLength, body)
 	}
 }
 

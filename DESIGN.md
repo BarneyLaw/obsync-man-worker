@@ -120,6 +120,13 @@ pre-commit verify is what guarantees at most one stealer commits. `gc -apply`
 takes the same lease. On a backend without exclusive create the lease is
 best-effort and logs that it is.
 
+Garage is such a backend. v2.3.0 accepts a second `PutObject` carrying
+`If-None-Match: *` rather than returning 412, so the S3 store probes for the
+behaviour instead of assuming it, and reports exclusive create as unsupported
+when the probe's second write succeeds. On Garage, then, `Forbid` remains the
+real guarantee for scheduled runs; the lease plus pre-commit verify narrows,
+but does not close, the window for a manual pull racing one.
+
 GC is a separate command, never in the worker: walk reachable manifests, list
 `blobs/`, delete the difference, skip anything younger than 24 hours so it
 cannot race an in-flight run.
@@ -346,10 +353,22 @@ in Go and one in TypeScript is not duplication. Resist building a Go consumer
 daemon as well, or you maintain two implementations of the same thing and mobile
 still does not work.
 
-What they *do* share is the manifest schema and the rule engine.
-`schema/policy-golden.json` is a fixture both test suites load. Fifteen assertions
-per side, and it catches every drift before the user sees a preview that does not
-match what the worker did.
+What they *do* share is the manifest schema and the rule engine, and both are
+pinned by fixtures in `schema/` that both test suites load. They catch every
+drift before the user sees a preview that does not match what the worker did.
+
+| Fixture | Owner | Go reads it in | Plugin reads it in |
+|---|---|---|---|
+| `policy-golden.json` | hand-written | `internal/policy` (decisions, and `invalid` policies `Parse` must reject) | `policy.test.ts` (same, via `validate`) |
+| `manifest-golden.json` | **generated** by the Go types | `internal/manifest` (byte-for-byte equal to what `Encode` writes) | `contract.test.ts`, `preview.test.ts` |
+| `store-contract.json` | **generated** | `internal/manifest` | `contract.test.ts` (key layout, `obsync:pull-scope`, states) |
+| `manifest-invalid.json` | hand-written | `internal/manifest` (`Decode` must refuse) | `contract.test.ts` (`parseManifest` must refuse) |
+
+The generated fixtures are rewritten with
+`go test ./internal/manifest -run TestContractFixtures -update`, so a change to
+what the worker writes shows up as a diff in `schema/` that the plugin suite then
+runs against. CI is split to match: `worker.yml` and `plugin.yml` each run when
+their half changes, and both run when any contract path changes.
 
 ### Researched implementation choices
 
@@ -438,7 +457,10 @@ Each step is useful on its own.
    ever show you anything meaningful, the manifest is the only human-readable
    index, and reading it is this tool's job.
 5. **Swap in S3 against Garage.** Nothing above changes. **Make Range GET your
-   first integration test**: the entire mobile story rests on it.
+   first integration test**: the entire mobile story rests on it. *Done: Range
+   GET, store conformance, presign and a full worker pass run against Garage
+   v2.3.0 locally (`scripts/garage-dev.sh`) and in CI. `obsync serve` fronts any
+   backend, so the plugin reads Garage without credentials.*
 6. **CronJob, Pushgateway, staleness alert.**
 7. **Plugin**: types + policy + preview first (pure, no Obsidian mocks needed),
    then transport, then the sync loop, then UI.
@@ -448,7 +470,10 @@ Each step is useful on its own.
 
 - Confirm NUS has not disabled manual access token generation. Ten minute check
   that gates everything.
-- Verify Range GET against Garage before writing the plugin's chunked path.
+- ~~Verify Range GET against Garage before writing the plugin's chunked path.~~
+  Verified on v2.3.0, through both the S3 API and the website endpoint.
+- Garage ignores `If-None-Match` on `PutObject`, so the lease is best-effort
+  there. Revisit if manual pulls ever run on a timer of their own.
 - Verify SubtleCrypto availability on Obsidian mobile if you go the direct-S3
   route.
 - Decide whether skipped-file "stub notes" (a small markdown placeholder with a

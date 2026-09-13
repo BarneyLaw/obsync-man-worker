@@ -1,0 +1,122 @@
+/* obsync — sidebar panel and settings validation. */
+
+.obsync-view {
+  padding: var(--size-4-3);
+  display: flex;
+  flex-direction: column;
+  gap: var(--size-4-2);
+}
+
+/* Status and the two global actions, pinned above the course list. */
+.obsync-view .obsync-head {
+  display: flex;
+  flex-direction: column;
+  gap: var(--size-2-2);
+  padding-bottom: var(--size-2-2);
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.obsync-view .obsync-status {
+  font-size: var(--font-ui-small);
+  color: var(--text-muted);
+}
+
+.obsync-view .obsync-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--size-2-2);
+  flex-wrap: wrap;
+}
+
+.obsync-view .obsync-actions .obsync-count {
+  margin-right: auto;
+}
+
+.obsync-view details {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s);
+  padding: var(--size-2-2) var(--size-2-3);
+}
+
+/* Nested sections (withheld inside a course) should not stack borders. */
+.obsync-view details details {
+  border: none;
+  padding: var(--size-2-2) 0 0 0;
+}
+
+.obsync-view summary {
+  cursor: pointer;
+  font-weight: var(--font-semibold);
+  padding: var(--size-2-1) 0;
+}
+
+.obsync-view p {
+  margin: var(--size-2-2) 0;
+}
+
+/* Bounded so a semester of entries cannot run away with the panel. */
+.obsync-view .obsync-list {
+  max-height: 45vh;
+  overflow-y: auto;
+  margin: var(--size-2-2) 0;
+}
+
+.obsync-view .obsync-row {
+  display: flex;
+  align-items: baseline;
+  gap: var(--size-2-2);
+  padding: var(--size-2-1) 0;
+}
+
+.obsync-view .obsync-label {
+  min-width: 0;
+  flex: 1;
+}
+
+.obsync-view .obsync-path {
+  word-break: break-word;
+  font-size: var(--font-ui-small);
+}
+
+.obsync-view .obsync-muted {
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+}
+
+/* Why a file was withheld, at a glance. */
+.obsync-view .obsync-tag {
+  flex: 0 0 auto;
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+  background: var(--background-modifier-hover);
+  border-radius: var(--radius-s);
+  padding: 0 var(--size-2-2);
+  white-space: nowrap;
+}
+
+.obsync-view .obsync-conflicts .obsync-row button {
+  flex: 0 0 auto;
+  font-size: var(--font-ui-smaller);
+  padding: var(--size-2-1) var(--size-2-2);
+}
+
+/* The panel is narrow; let the settings form stack instead of overflowing. */
+.obsync-view .obsync-setup .setting-item {
+  display: block;
+  padding: var(--size-2-3) 0;
+  border: none;
+}
+
+.obsync-view .obsync-setup .setting-item-control {
+  justify-content: flex-start;
+  padding-top: var(--size-2-2);
+}
+
+.obsync-view .obsync-setup .setting-item-control input[type="text"],
+.obsync-view .obsync-setup .setting-item-control textarea {
+  width: 100%;
+}
+
+.obsync-error {
+  color: var(--text-error);
+}

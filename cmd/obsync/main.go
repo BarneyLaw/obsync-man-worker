@@ -50,7 +50,7 @@ import (
 func main() { os.Exit(realMain()) }
 
 func realMain() int {
-	root := flag.String("fs-store", "./.obsync-store", "store root (dev)")
+	root := flag.String("fs-store", "", "store root directory (default ./.obsync-store, or S3 when GARAGE_ENDPOINT is set)")
 	level := flag.String("log-level", "info", "debug, info, warn or error")
 	flag.Usage = usage
 	flag.Parse()
@@ -66,15 +66,27 @@ func realMain() int {
 		return 2
 	}
 	log = log.With("command", args[0])
-	if info, err := os.Stat(*root); err != nil || !info.IsDir() {
-		fmt.Fprintf(os.Stderr, "error: store %s is not a directory (run the worker first, or pass -fs-store)\n", *root)
-		return 1
+
+	fsRoot := *root
+	if fsRoot == "" && os.Getenv(store.S3Env.Endpoint) == "" {
+		fsRoot = "./.obsync-store"
 	}
+	raw, desc, err := store.Open(fsRoot, os.Getenv)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 2
+	}
+	if desc.Kind == "fs" {
+		if info, err := os.Stat(fsRoot); err != nil || !info.IsDir() {
+			fmt.Fprintf(os.Stderr, "error: store %s is not a directory (run the worker first, or pass -fs-store)\n", fsRoot)
+			return 1
+		}
+	}
+	log.Debug("store.configured", "kind", desc.Kind, "location", desc.Location)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	fsStore := store.NewFS(*root)
-	st := store.WithLogging(fsStore, log)
+	st := store.WithLogging(raw, log)
 
 	switch args[0] {
 	case "ls":
@@ -90,7 +102,7 @@ func realMain() int {
 	case "gc":
 		err = cmdGC(ctx, st, log, args[1:])
 	case "serve":
-		err = cmdServe(ctx, fsStore, log, args[1:])
+		err = cmdServe(ctx, raw, desc, log, args[1:])
 	default:
 		usage()
 		return 2
@@ -357,9 +369,10 @@ func cmdGC(ctx context.Context, st store.Store, log *slog.Logger, args []string)
 	return nil
 }
 
-func cmdServe(ctx context.Context, fsStore *store.FS, log *slog.Logger, args []string) error {
+func cmdServe(ctx context.Context, raw store.Store, desc store.Description, log *slog.Logger, args []string) error {
 	fs := flag.NewFlagSet("obsync serve", flag.ContinueOnError)
 	addr := fs.String("addr", "127.0.0.1:8765", "listen address")
+	bucket := fs.String("bucket", "obsync", "also serve keys under /<bucket>/, as the plugin's Bucket setting requests them; empty to disable")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -370,16 +383,24 @@ func cmdServe(ctx context.Context, fsStore *store.FS, log *slog.Logger, args []s
 			"risk", "the store is served without authentication to anything that can reach this address")
 	}
 
-	srv := &http.Server{Addr: *addr, Handler: &storeHandler{fs: fsStore, log: log}, ReadHeaderTimeout: 10 * time.Second}
+	obj, ok := raw.(objectStore)
+	if !ok {
+		return fmt.Errorf("store %s cannot be served: it does not support stat and range reads", desc)
+	}
+	srv := &http.Server{
+		Addr:              *addr,
+		Handler:           &storeHandler{st: obj, log: log, bucket: *bucket},
+		ReadHeaderTimeout: 10 * time.Second,
+	}
 	go func() {
 		<-ctx.Done()
 		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		srv.Shutdown(sctx)
 	}()
-	root, _ := filepath.Abs(fsStore.Root)
-	log.Info("serve.start", "addr", *addr, "root", root)
-	fmt.Fprintf(os.Stderr, "serving %s read-only at http://%s  (plugin base URL)\n", root, *addr)
+	log.Info("serve.start", "addr", *addr, "store", desc.String(), "bucket", *bucket)
+	fmt.Fprintf(os.Stderr, "serving %s read-only\n  plugin Store URL: http://%s\n  plugin Bucket:    %q (or empty)\n",
+		desc, *addr, *bucket)
 	if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
@@ -387,12 +408,22 @@ func cmdServe(ctx context.Context, fsStore *store.FS, log *slog.Logger, args []s
 	return nil
 }
 
+// objectStore is what serve needs from a backend: FS and S3 both qualify, so
+// the same read-only view fronts a local directory or Garage.
+type objectStore interface {
+	store.Stater
+	store.RangeReader
+}
+
 // storeHandler exposes exactly the keys a consumer reads, the same shape the
-// plugin expects from Garage behind an auth proxy: GET {base}/{key} with Range.
-// Read-only, no directory listings, nothing outside manifests/ and blobs/.
+// plugin expects from Garage behind an auth proxy: GET {base}/{key}, or
+// GET {base}/{bucket}/{key} when the plugin's Bucket setting is filled in, with
+// Range. Read-only, no directory listings, nothing outside manifests/ and blobs/.
+// Against S3 it is that auth proxy: the plugin holds no credentials.
 type storeHandler struct {
-	fs  *store.FS
-	log *slog.Logger
+	st     objectStore
+	log    *slog.Logger
+	bucket string
 }
 
 func (h *storeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -410,6 +441,9 @@ func (h *storeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	key := strings.TrimPrefix(r.URL.Path, "/")
+	if h.bucket != "" {
+		key = strings.TrimPrefix(key, h.bucket+"/")
+	}
 	if !strings.HasPrefix(key, "manifests/") && !strings.HasPrefix(key, "blobs/") {
 		http.NotFound(rec, r)
 		return
@@ -420,22 +454,22 @@ func (h *storeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	p, err := h.fs.Path(key)
+	if store.ValidKey(key) != nil {
+		http.NotFound(rec, r)
+		return
+	}
+	info, err := h.st.Stat(r.Context(), key)
+	if errors.Is(err, store.ErrNotFound) {
+		http.NotFound(rec, r)
+		return
+	}
 	if err != nil {
-		http.NotFound(rec, r)
+		h.log.Warn("serve.stat_failed", "key", key, "err", err)
+		http.Error(rec, "store unavailable", http.StatusBadGateway)
 		return
 	}
-	f, err := os.Open(p)
-	if err != nil {
-		http.NotFound(rec, r)
-		return
-	}
-	defer f.Close()
-	info, err := f.Stat()
-	if err != nil || info.IsDir() {
-		http.NotFound(rec, r)
-		return
-	}
+	body := &objectReader{ctx: r.Context(), rr: h.st, key: key, size: info.Size}
+	defer body.Close()
 
 	switch {
 	case strings.HasSuffix(key, "/latest"):
@@ -449,7 +483,7 @@ func (h *storeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		rec.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 		rec.Header().Set("Content-Type", "application/octet-stream")
 	}
-	http.ServeContent(rec, r, "", info.ModTime(), f)
+	http.ServeContent(rec, r, "", info.Modified, body)
 }
 
 type statusRecorder struct {

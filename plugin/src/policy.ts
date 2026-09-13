@@ -4,8 +4,9 @@
 // (irreversible). This decides what enters THIS VAULT (reversible, per-device).
 // Different defaults, different consequences, same rule schema.
 //
-// Both implementations are tested against schema/policy-golden.json. If you
-// change one, change the fixture, and run both suites.
+// Both implementations are tested against the repo root's
+// schema/policy-golden.json, one file shared with the Go suite. If you change
+// one engine, change the fixture, and run both suites.
 
 export type Action = "include" | "skip";
 
@@ -22,12 +23,15 @@ export interface Rule {
   priority: number;
   match: Match;
   action: Action;
+  /** Free text for humans, as in deploy/rules.json. Ignored by the engine. */
+  _comment?: string;
 }
 
 export interface Policy {
   version: number;
   default: Action;
   rules: Rule[];
+  _comment?: string;
 }
 
 export interface Candidate {
@@ -43,17 +47,78 @@ export interface Decision {
   reason: string;
 }
 
+const POLICY_KEYS: ReadonlySet<string> = new Set(["version", "default", "rules", "_comment"]);
+const RULE_KEYS: ReadonlySet<string> = new Set(["name", "priority", "match", "action", "_comment"]);
+const MATCH_KEYS: ReadonlySet<string> = new Set(["ext", "glob", "min_size", "max_size", "course_ids"]);
+
+type Obj = Record<string, unknown>;
+
+const isObj = (v: unknown): v is Obj => typeof v === "object" && v !== null && !Array.isArray(v);
+const extraKey = (o: Obj, allowed: ReadonlySet<string>) => Object.keys(o).find((k) => !allowed.has(k));
+const optional = (v: unknown, ok: (v: unknown) => boolean) => v === undefined || v === null || ok(v);
+const isStringList = (v: unknown) => Array.isArray(v) && v.every((s) => typeof s === "string");
+const isIntList = (v: unknown) => Array.isArray(v) && v.every((n) => Number.isInteger(n));
+
+/**
+ * Behavioural twin of policy.Parse in Go, which decodes strictly.
+ *
+ * The value arrives from a user-edited JSON textarea, so the declared type is a
+ * claim, not a guarantee: every shape is checked the way Go's decoder would.
+ * Unknown fields are rejected because a typo like "max_szie" would otherwise
+ * be dropped silently, leaving a rule far broader than the one written. The
+ * `invalid` section of the shared golden fixture holds both sides to this.
+ */
 export function validate(p: Policy): string | null {
-  if (p.version !== 1) return `unsupported policy version ${p.version}`;
-  if (p.default !== "include" && p.default !== "skip") return `bad default ${p.default}`;
+  const raw: unknown = p;
+  if (!isObj(raw)) return "policy must be a JSON object";
+  const extra = extraKey(raw, POLICY_KEYS);
+  if (extra !== undefined) return `unknown field ${extra}`;
+  if (raw.version !== 1) return `unsupported policy version ${String(raw.version)}`;
+  if (raw.default !== "include" && raw.default !== "skip") return `bad default ${String(raw.default)}`;
+  if (!Array.isArray(raw.rules)) return "rules must be an array";
+
   const seen = new Set<string>();
-  for (const r of p.rules) {
-    if (!r.name) return "a rule has no name";
-    if (seen.has(r.name)) return `duplicate rule name ${r.name}`;
-    seen.add(r.name);
-    if (isEmptyMatch(r.match)) {
-      return `rule ${r.name} matches everything, which is what default is for`;
-    }
+  for (const r of raw.rules as unknown[]) {
+    const err = validateRule(r, seen);
+    if (err !== null) return err;
+  }
+  return null;
+}
+
+function validateRule(r: unknown, seen: Set<string>): string | null {
+  if (!isObj(r)) return "a rule is not an object";
+  const name = typeof r.name === "string" ? r.name : "";
+  if (!name) return "a rule has no name";
+  const extra = extraKey(r, RULE_KEYS);
+  if (extra !== undefined) return `rule ${name} has unknown field ${extra}`;
+  if (seen.has(name)) return `duplicate rule name ${name}`;
+  seen.add(name);
+  if (r.action !== "include" && r.action !== "skip") {
+    return `rule ${name} has bad action ${String(r.action)}`;
+  }
+  // Go decodes priority into an int, which refuses 1.5.
+  if (typeof r.priority !== "number" || !Number.isInteger(r.priority)) {
+    return `rule ${name} has a non-integer priority`;
+  }
+
+  const m = r.match;
+  if (!isObj(m)) return `rule ${name} has no match`;
+  const mextra = extraKey(m, MATCH_KEYS);
+  if (mextra !== undefined) return `rule ${name} has unknown match field ${mextra}`;
+  if (!optional(m.ext, isStringList)) return `rule ${name}: ext must be a list of strings`;
+  if (!optional(m.glob, isStringList)) return `rule ${name}: glob must be a list of strings`;
+  if (!optional(m.min_size, Number.isInteger)) return `rule ${name}: min_size must be a whole number of bytes`;
+  if (!optional(m.max_size, Number.isInteger)) return `rule ${name}: max_size must be a whole number of bytes`;
+  if (!optional(m.course_ids, isIntList)) return `rule ${name}: course_ids must be a list of numbers`;
+
+  const match = m as Match;
+  if (isEmptyMatch(match)) {
+    return `rule ${name} matches everything, which is what default is for`;
+  }
+  // Go's path.Match returns ErrBadPattern for these; catching it here means
+  // the user finds out while editing rules, not silently at preview time.
+  for (const g of match.glob ?? []) {
+    if (compileGlob(g) === null) return `rule ${name} has an invalid glob pattern ${g}`;
   }
   return null;
 }
@@ -109,16 +174,118 @@ export function ext(p: string): string {
 }
 
 /**
- * Go's path.Match semantics, not full globbing: `*` does not cross `/`.
- * Matching Go exactly here is the whole point, since the golden fixture is
- * shared.
+ * Go's path.Match semantics, not full globbing. Matching Go exactly here is the
+ * whole point, since the golden fixture is shared with internal/policy.
+ *
+ * Supported, per Go's grammar:
+ *   *          any run of non-separator characters
+ *   ?          one non-separator character
+ *   [abc]      character class; [^abc] negates (Go uses ^, not !)
+ *   [a-z]      range
+ *   \x         literal x
+ *
+ * A malformed pattern (unterminated class, empty class, reversed range,
+ * trailing backslash) is Go's ErrBadPattern and matches nothing. validate()
+ * surfaces those to the user rather than letting a rule quietly never fire.
  */
 export function globMatch(pattern: string, name: string): boolean {
-  const rx = pattern
-    .replace(/[.+^${}()|[\]\\]/g, "\\$&")
-    .replace(/\*/g, "[^/]*")
-    .replace(/\?/g, "[^/]");
-  return new RegExp(`^${rx}$`).test(name);
+  const rx = compileGlob(pattern);
+  return rx !== null && rx.test(name);
+}
+
+const globCache = new Map<string, RegExp | null>();
+
+/** @returns null for a pattern Go would reject with ErrBadPattern. */
+export function compileGlob(pattern: string): RegExp | null {
+  const hit = globCache.get(pattern);
+  if (hit !== undefined) return hit;
+  const rx = buildGlob(pattern);
+  globCache.set(pattern, rx);
+  return rx;
+}
+
+function buildGlob(pattern: string): RegExp | null {
+  let out = "";
+  let i = 0;
+  while (i < pattern.length) {
+    const c = pattern[i]!;
+    if (c === "*") {
+      // The one rule that makes this path matching rather than string matching.
+      out += "[^/]*";
+      i++;
+    } else if (c === "?") {
+      out += "[^/]";
+      i++;
+    } else if (c === "\\") {
+      if (i + 1 >= pattern.length) return null; // trailing backslash
+      out += escLiteral(pattern[i + 1]!);
+      i += 2;
+    } else if (c === "[") {
+      const cls = buildClass(pattern, i);
+      if (cls === null) return null;
+      out += cls.src;
+      i = cls.next;
+    } else {
+      out += escLiteral(c);
+      i++;
+    }
+  }
+  try {
+    return new RegExp(`^${out}$`, "u");
+  } catch {
+    return null;
+  }
+}
+
+function buildClass(p: string, start: number): { src: string; next: number } | null {
+  let i = start + 1;
+  let neg = false;
+  if (p[i] === "^") {
+    neg = true;
+    i++;
+  }
+  let body = "";
+  let count = 0;
+  while (i < p.length && p[i] !== "]") {
+    const lo = readClassChar(p, i);
+    if (lo === null) return null;
+    i = lo.next;
+    if (p[i] === "-" && i + 1 < p.length && p[i + 1] !== "]") {
+      const hi = readClassChar(p, i + 1);
+      if (hi === null) return null;
+      if (hi.ch < lo.ch) return null; // Go rejects a reversed range
+      body += `${escClass(lo.ch)}-${escClass(hi.ch)}`;
+      i = hi.next;
+    } else {
+      body += escClass(lo.ch);
+    }
+    count++;
+  }
+  if (i >= p.length) return null; // unterminated
+  if (count === 0) return null;   // Go requires a non-empty class
+  return { src: `[${neg ? "^" : ""}${body}]`, next: i + 1 };
+}
+
+function readClassChar(p: string, i: number): { ch: string; next: number } | null {
+  if (i >= p.length) return null;
+  if (p[i] === "\\") {
+    if (i + 1 >= p.length) return null;
+    return { ch: p[i + 1]!, next: i + 2 };
+  }
+  return { ch: p[i]!, next: i + 1 };
+}
+
+// The `u` flag only permits escaping actual syntax characters, so escape
+// exactly those and leave everything else alone.
+const SYNTAX = new Set(["^", "$", "\\", ".", "*", "+", "?", "(", ")", "[", "]", "{", "}", "|", "/"]);
+const CLASS_SYNTAX = new Set(["\\", "]", "^", "-"]);
+
+function escLiteral(ch: string): string {
+  return SYNTAX.has(ch) ? `\\${ch}` : ch;
+}
+
+function escClass(ch: string): string {
+  return CLASS_SYNTAX.has(ch) ? `\\${ch}` : ch;
 }
 
 export function humanBytes(n: number): string {
