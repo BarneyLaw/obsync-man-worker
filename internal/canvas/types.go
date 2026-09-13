@@ -7,6 +7,9 @@ type Course struct {
 	ID   int64  `json:"id"`
 	Name string `json:"name"`
 	Code string `json:"course_code"`
+	// AccessRestrictedByDate marks a stub for a course outside its term
+	// dates: Canvas returns only the id and this flag.
+	AccessRestrictedByDate bool `json:"access_restricted_by_date"`
 }
 
 // File mirrors the Canvas REST file object.
@@ -34,7 +37,7 @@ type File struct {
 	Hidden      bool       `json:"hidden"`
 	// LockedForUser is the field that actually matters: a file can be visible
 	// in the listing and still not downloadable.
-	LockedForUser bool `json:"locked_for_user"`
+	LockedForUser bool   `json:"locked_for_user"`
 	MimeClass     string `json:"mime_class"`
 }
 

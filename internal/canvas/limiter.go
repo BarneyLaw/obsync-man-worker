@@ -1,10 +1,14 @@
 package canvas
 
 import (
+	"context"
+	"io"
+	"log/slog"
 	"math/rand"
 	"net/http"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -20,21 +24,39 @@ import (
 // concurrency.
 type Limiter struct {
 	Base http.RoundTripper
-	// Floor is the remaining-quota level below which we stall.
+	// Floor is the remaining-quota level below which a request first stalls.
 	Floor float64
+	// Stall is how long to pause when the last observed quota is below Floor.
+	Stall time.Duration
 	// MaxRetries on throttle responses.
 	MaxRetries int
+	// MaxInFlight caps concurrent API requests.
+	MaxInFlight int
+	// MaxRetryAfter caps a server-supplied Retry-After.
+	MaxRetryAfter time.Duration
+	Log           *slog.Logger
+
+	semOnce sync.Once
+	sem     chan struct{}
 
 	mu        sync.Mutex
 	remaining float64
 	blockedTo time.Time
+
+	throttles atomic.Int64
+	stalls    atomic.Int64
 }
 
 func NewLimiter(base http.RoundTripper) *Limiter {
 	if base == nil {
 		base = http.DefaultTransport
 	}
-	return &Limiter{Base: base, Floor: 100, MaxRetries: 5, remaining: 700}
+	return &Limiter{
+		Base: base, Floor: 100, Stall: 5 * time.Second, MaxRetries: 5,
+		MaxInFlight: 3, MaxRetryAfter: 5 * time.Minute,
+		Log:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+		remaining: 700,
+	}
 }
 
 func (l *Limiter) Remaining() float64 {
@@ -43,9 +65,21 @@ func (l *Limiter) Remaining() float64 {
 	return l.remaining
 }
 
+func (l *Limiter) Throttles() int64 { return l.throttles.Load() }
+func (l *Limiter) Stalls() int64    { return l.stalls.Load() }
+
 func (l *Limiter) RoundTrip(req *http.Request) (*http.Response, error) {
+	ctx := req.Context()
+	if err := l.acquire(ctx); err != nil {
+		return nil, err
+	}
+	defer l.release()
+
+	retryable := req.Body == nil || req.Body == http.NoBody
 	for attempt := 0; ; attempt++ {
-		l.wait()
+		if err := l.wait(ctx, req); err != nil {
+			return nil, err
+		}
 
 		resp, err := l.Base.RoundTrip(req)
 		if err != nil {
@@ -56,13 +90,42 @@ func (l *Limiter) RoundTrip(req *http.Request) (*http.Response, error) {
 		// Instructure's own docs disagree about whether throttling returns 403
 		// or 429, so treat both as throttle. 401 is NOT retryable: a dead token
 		// should page you, not spin for an hour.
-		if !isThrottle(resp) || attempt >= l.MaxRetries {
+		if !isThrottle(resp) {
+			return resp, nil
+		}
+		l.throttles.Add(1)
+		if !retryable || attempt >= l.MaxRetries {
+			l.Log.Warn("canvas.throttle_exhausted", "path", req.URL.Path,
+				"status", resp.StatusCode, "attempts", attempt+1)
 			return resp, nil
 		}
 		resp.Body.Close()
-		l.backoff(attempt, resp)
+		d := l.backoff(attempt, resp)
+		l.Log.Warn("canvas.throttled", "path", req.URL.Path, "status", resp.StatusCode,
+			"attempt", attempt+1, "backoff_ms", d.Milliseconds(), "rate_limit_remaining", l.Remaining())
+		if err := sleep(ctx, d); err != nil {
+			return nil, err
+		}
 	}
 }
+
+func (l *Limiter) acquire(ctx context.Context) error {
+	l.semOnce.Do(func() {
+		n := l.MaxInFlight
+		if n <= 0 {
+			n = 1
+		}
+		l.sem = make(chan struct{}, n)
+	})
+	select {
+	case l.sem <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (l *Limiter) release() { <-l.sem }
 
 func isThrottle(resp *http.Response) bool {
 	if resp.StatusCode == http.StatusTooManyRequests {
@@ -94,26 +157,42 @@ func (l *Limiter) observe(resp *http.Response) {
 	l.mu.Unlock()
 }
 
-func (l *Limiter) wait() {
-	for {
-		l.mu.Lock()
-		blocked := l.blockedTo
-		rem := l.remaining
-		l.mu.Unlock()
+// wait pauses at most once per call for low quota.
+//
+// The client only learns the bucket level from response headers, so it cannot
+// watch the bucket refill without making a request. The previous version
+// looped until remaining rose above Floor, which only a request could make
+// happen, and hung forever. Now it stalls once, then assumes recovery and lets
+// the next response correct the estimate.
+func (l *Limiter) wait(ctx context.Context, req *http.Request) error {
+	l.mu.Lock()
+	blocked := l.blockedTo
+	rem := l.remaining
+	l.mu.Unlock()
 
-		if d := time.Until(blocked); d > 0 {
-			time.Sleep(d)
-			continue
+	if d := time.Until(blocked); d > 0 {
+		if err := sleep(ctx, d); err != nil {
+			return err
 		}
-		if rem >= l.Floor {
-			return
-		}
-		time.Sleep(2 * time.Second)
 	}
+	if rem < l.Floor {
+		l.stalls.Add(1)
+		l.Log.Info("canvas.quota_low_stall", "path", req.URL.Path, "rate_limit_remaining", rem,
+			"floor", l.Floor, "stall_ms", l.Stall.Milliseconds())
+		if err := sleep(ctx, l.Stall); err != nil {
+			return err
+		}
+		l.mu.Lock()
+		if l.remaining < l.Floor {
+			l.remaining = l.Floor
+		}
+		l.mu.Unlock()
+	}
+	return nil
 }
 
-func (l *Limiter) backoff(attempt int, resp *http.Response) {
-	d := time.Duration(1<<uint(attempt)) * time.Second
+func (l *Limiter) backoff(attempt int, resp *http.Response) time.Duration {
+	d := time.Duration(1<<uint(min(attempt, 6))) * time.Second
 	if d > 60*time.Second {
 		d = 60 * time.Second
 	}
@@ -121,12 +200,28 @@ func (l *Limiter) backoff(attempt int, resp *http.Response) {
 	// re-fills the bucket immediately.
 	d += time.Duration(rand.Int63n(int64(d / 2)))
 	if ra := resp.Header.Get("Retry-After"); ra != "" {
-		if secs, err := strconv.Atoi(ra); err == nil {
-			d = time.Duration(secs) * time.Second
+		if secs, err := strconv.Atoi(ra); err == nil && secs >= 0 {
+			d = min(time.Duration(secs)*time.Second, l.MaxRetryAfter)
 		}
 	}
 	l.mu.Lock()
 	l.blockedTo = time.Now().Add(d)
 	l.mu.Unlock()
-	time.Sleep(d)
+	return d
+}
+
+// sleep is a cancellable time.Sleep. SIGTERM from Kubernetes must not wait out
+// a minute of backoff.
+func sleep(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return ctx.Err()
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
 }
