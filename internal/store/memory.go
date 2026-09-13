@@ -13,14 +13,19 @@ import (
 // Memory is the test double. It implements RangeReader so the plugin's chunked
 // path can be exercised without a live Garage.
 type Memory struct {
-	mu   sync.RWMutex
-	data map[string][]byte
-	// PutErr, if set, fails the next Put. Used to test that a crashed run
-	// never publishes a torn manifest.
-	PutErr error
+	mu       sync.RWMutex
+	data     map[string][]byte
+	modified map[string]time.Time
+	// PutErr, if set, fails every Put whose key it returns an error for. Used
+	// to test that a crashed run never publishes a torn manifest.
+	PutErr func(key string) error
+	// Now stamps object modification times. Defaults to time.Now.
+	Now func() time.Time
 }
 
-func NewMemory() *Memory { return &Memory{data: map[string][]byte{}} }
+func NewMemory() *Memory {
+	return &Memory{data: map[string][]byte{}, modified: map[string]time.Time{}, Now: time.Now}
+}
 
 func (m *Memory) Get(_ context.Context, key string) (io.ReadCloser, error) {
 	m.mu.RLock()
@@ -49,17 +54,46 @@ func (m *Memory) GetRange(_ context.Context, key string, off, n int64) (io.ReadC
 	return io.NopCloser(bytes.NewReader(b[off:end])), nil
 }
 
-func (m *Memory) Put(_ context.Context, key string, r io.Reader, _ int64) error {
+func (m *Memory) read(key string, r io.Reader, size int64) ([]byte, error) {
+	if err := ValidKey(key); err != nil {
+		return nil, err
+	}
 	if m.PutErr != nil {
-		return m.PutErr
+		if err := m.PutErr(key); err != nil {
+			return nil, err
+		}
 	}
 	b, err := io.ReadAll(r)
+	if err != nil {
+		return nil, err
+	}
+	return b, checkSize(key, size, int64(len(b)))
+}
+
+func (m *Memory) Put(_ context.Context, key string, r io.Reader, size int64) error {
+	b, err := m.read(key, r, size)
 	if err != nil {
 		return err
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.data[key] = b
+	m.modified[key] = m.Now()
+	return nil
+}
+
+func (m *Memory) PutIfAbsent(_ context.Context, key string, r io.Reader, size int64) error {
+	b, err := m.read(key, r, size)
+	if err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.data[key]; ok {
+		return ErrExists
+	}
+	m.data[key] = b
+	m.modified[key] = m.Now()
 	return nil
 }
 
@@ -74,24 +108,22 @@ func (m *Memory) Delete(_ context.Context, key string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.data, key)
+	delete(m.modified, key)
 	return nil
 }
 
 func (m *Memory) List(_ context.Context, prefix string, fn func(ObjectInfo) error) error {
 	m.mu.RLock()
-	keys := make([]string, 0, len(m.data))
-	for k := range m.data {
+	infos := make([]ObjectInfo, 0, len(m.data))
+	for k, b := range m.data {
 		if strings.HasPrefix(k, prefix) {
-			keys = append(keys, k)
+			infos = append(infos, ObjectInfo{Key: k, Size: int64(len(b)), Modified: m.modified[k]})
 		}
 	}
 	m.mu.RUnlock()
-	sort.Strings(keys)
-	for _, k := range keys {
-		m.mu.RLock()
-		size := int64(len(m.data[k]))
-		m.mu.RUnlock()
-		if err := fn(ObjectInfo{Key: k, Size: size, Modified: time.Now()}); err != nil {
+	sort.Slice(infos, func(i, j int) bool { return infos[i].Key < infos[j].Key })
+	for _, info := range infos {
+		if err := fn(info); err != nil {
 			return err
 		}
 	}
