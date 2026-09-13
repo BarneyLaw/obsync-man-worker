@@ -8,13 +8,19 @@
 // itself before writing anything.
 //
 // Guarantees, stated honestly:
-//   - On a backend with ExclusivePutter (FS, Memory, S3 with If-None-Match),
-//     acquisition is exclusive.
+//   - On a backend with a working exclusive create (FS, Memory, and S3 servers
+//     proven to honour If-None-Match), acquisition is exclusive. Garage v2.3.0
+//     is not one of them.
 //   - A lease past its expiry may be stolen. Stealing is delete-then-create,
 //     which is not atomic, so two stealers can both believe they won. That is
 //     why the runner calls Verify immediately before publishing latest: at
 //     most one of them still sees its own holder id there.
-//   - Without ExclusivePutter the lease is best-effort and says so in the logs.
+//   - Otherwise the lease is best-effort and says so in the logs
+//     (lease.best_effort): it verifies itself straight after writing and again
+//     before every commit, which stops a second writer committing once it has
+//     been overwritten, but cannot stop two writers that race inside that
+//     window. On Garage, scheduled runs stay single through the CronJob's
+//     concurrencyPolicy: Forbid; keep manual pulls clear of the schedule.
 package lease
 
 import (
