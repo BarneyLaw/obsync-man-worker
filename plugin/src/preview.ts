@@ -1,4 +1,4 @@
-import { Manifest, Entry, liveEntries } from "./types";
+import { Manifest, Entry, liveEntries, SCOPE_RULE } from "./types";
 import { Policy, evaluate, humanBytes } from "./policy";
 import { LocalState } from "./state";
 
@@ -10,7 +10,15 @@ import { LocalState } from "./state";
  */
 export interface PreviewItem {
   entry: Entry;
-  action: "download" | "update" | "have" | "skip-local" | "skip-worker" | "locked" | "unavailable";
+  action:
+    | "download"
+    | "update"
+    | "have"
+    | "skip-local"
+    | "skip-worker"
+    | "deferred"
+    | "locked"
+    | "unavailable";
   reason: string;
 }
 
@@ -21,13 +29,15 @@ export interface Preview {
   alreadyHave: number;
   skippedLocal: number;
   skippedWorker: number;
+  /** Deferred by a scoped manual pull; the worker's next full pull fetches them. */
+  deferred: number;
   locked: number;
 }
 
 export function preview(m: Manifest, p: Policy, state: LocalState): Preview {
   const out: Preview = {
     items: [], toDownload: 0, bytesToDownload: 0,
-    alreadyHave: 0, skippedLocal: 0, skippedWorker: 0, locked: 0,
+    alreadyHave: 0, skippedLocal: 0, skippedWorker: 0, deferred: 0, locked: 0,
   };
 
   for (const e of liveEntries(m)) {
@@ -42,6 +52,7 @@ export function preview(m: Manifest, p: Policy, state: LocalState): Preview {
       case "have": out.alreadyHave++; break;
       case "skip-local": out.skippedLocal++; break;
       case "skip-worker": out.skippedWorker++; break;
+      case "deferred": out.deferred++; break;
       case "locked": out.locked++; break;
     }
   }
@@ -54,6 +65,11 @@ function classify(e: Entry, courseId: number, p: Policy, state: LocalState): Pre
     return { entry: e, action: "locked", reason: `unlocks ${when}` };
   }
   if (e.state === "skipped") {
+    if (e.rule_name === SCOPE_RULE) {
+      // Not a rule anyone wrote: a scoped manual pull on the worker left this
+      // for later. Nothing for the user to change; it arrives on its own.
+      return { entry: e, action: "deferred", reason: "waiting for the worker's next full pull" };
+    }
     // Surfaced, not hidden. The user can request it, and phase 1 answers that
     // by writing to the request bucket (or by relaxing worker rules).
     return { entry: e, action: "skip-worker", reason: e.reason ?? "excluded by worker rules" };
@@ -68,12 +84,16 @@ function classify(e: Entry, courseId: number, p: Policy, state: LocalState): Pre
     return { entry: e, action: "skip-local", reason: d.reason };
   }
 
+  // The worker only annotates a stored entry when a human should know
+  // something: a stand-in name for an unportable Canvas filename, or a failed
+  // refresh that means an older version is being served.
+  const note = e.reason ? ` (${e.reason})` : "";
   const known = state.files[e.path];
   if (known && known.sha256 === e.sha256) {
-    return { entry: e, action: "have", reason: "up to date" };
+    return { entry: e, action: "have", reason: `up to date${note}` };
   }
   if (known) {
-    return { entry: e, action: "update", reason: `changed, ${humanBytes(e.size)}` };
+    return { entry: e, action: "update", reason: `changed, ${humanBytes(e.size)}${note}` };
   }
-  return { entry: e, action: "download", reason: `new, ${humanBytes(e.size)}` };
+  return { entry: e, action: "download", reason: `new, ${humanBytes(e.size)}${note}` };
 }

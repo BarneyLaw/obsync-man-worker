@@ -4,7 +4,7 @@ import { bytesToHex } from "@noble/hashes/utils.js";
 import type { Plugin } from "obsidian";
 import { Syncer, uniquify } from "./sync";
 import { RemoteStore } from "./store";
-import { Manifest, Entry, blobKey } from "./types";
+import { Manifest, Entry, blobKey, latestKey, manifestKey } from "./types";
 import { LocalState, emptyState } from "./state";
 import { Policy } from "./policy";
 
@@ -91,7 +91,12 @@ class FakePlugin {
 /** Serves blob bytes by hash; records what was requested. */
 class FakeStore {
   gets: string[] = [];
+  /** Text objects (latest pointers, manifests) by key. */
+  texts = new Map<string, string>();
   constructor(public blobs: Map<string, Uint8Array>) {}
+  getText(key: string) {
+    return Promise.resolve(this.texts.get(key) ?? null);
+  }
   getBinary(key: string) {
     this.gets.push(key);
     const b = this.blobs.get(key);
@@ -147,6 +152,40 @@ function build(contents: string[]) {
     new Syncer(plugin as unknown as Plugin, store as unknown as RemoteStore, OPEN, s, FOLDERS);
   return { adapter, plugin, store, state, make };
 }
+
+describe("fetchManifest", () => {
+  it("follows latest to the manifest it names, tolerating a trailing newline", async () => {
+    const { store, make } = build([]);
+    store.texts.set(latestKey(42), "run-9\n");
+    store.texts.set(manifestKey(42, "run-9"), JSON.stringify(manifest([entry("a.pdf", "x")], "run-9")));
+
+    const m = await make().fetchManifest(42);
+
+    expect(m?.run_id).toBe("run-9");
+  });
+
+  it("returns null before the worker has published the course", async () => {
+    const { make } = build([]);
+    expect(await make().fetchManifest(42)).toBeNull();
+  });
+
+  it("refuses a manifest that names another course", async () => {
+    const { store, make } = build([]);
+    const foreign = { ...manifest([entry("a.pdf", "x")], "run-9"), course_id: 7 };
+    store.texts.set(latestKey(42), "run-9");
+    store.texts.set(manifestKey(42, "run-9"), JSON.stringify(foreign));
+
+    await expect(make().fetchManifest(42)).rejects.toThrow(/claims course 7/);
+  });
+
+  it("refuses a manifest from a different run than latest names", async () => {
+    const { store, make } = build([]);
+    store.texts.set(latestKey(42), "run-9");
+    store.texts.set(manifestKey(42, "run-9"), JSON.stringify(manifest([], "run-8")));
+
+    await expect(make().fetchManifest(42)).rejects.toThrow(/run run-8/);
+  });
+});
 
 describe("writeEntry: downloading", () => {
   it("writes a new file and records its hash", async () => {

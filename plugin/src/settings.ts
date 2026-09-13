@@ -38,7 +38,9 @@ export type ObsyncPluginLike = Plugin & {
   rescheduleSync(): void;
 };
 
-const COURSES_DESC = "Comma-separated Canvas course IDs, e.g. 12345, 67890.";
+const COURSES_DESC =
+  "Comma-separated numeric Canvas course IDs, e.g. 93794. The store is keyed by ID, " +
+  "not course code: run obsync ls or obsync-worker courses to list them.";
 const RULES_DESC =
   "Applied to the manifest locally. Reversible: changing these never needs a refetch.";
 
@@ -63,7 +65,8 @@ export function renderSettings(
     .setDesc(
       "Read-only endpoint for the obsync bucket. Prefer an endpoint already " +
       "protected at the network layer (Tailscale, auth proxy) so no credentials " +
-      "are stored in the vault.",
+      "are stored in the vault. For local development, run obsync serve and " +
+      "use http://127.0.0.1:8765.",
     )
     .addText((t) =>
       t
@@ -77,7 +80,10 @@ export function renderSettings(
 
   new Setting(containerEl)
     .setName("Bucket")
-    .setDesc("Leave empty if the URL already points at the bucket root.")
+    .setDesc(
+      "Path segment between the URL and the store keys. Leave empty if the URL " +
+      "already points at the bucket root; obsync serve accepts either.",
+    )
     .addText((t) =>
       t.setValue(plugin.settings.bucket).onChange(async (v) => {
         plugin.settings.bucket = v.trim();

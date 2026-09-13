@@ -44,11 +44,20 @@ export class Syncer {
   ) {}
 
   async fetchManifest(courseId: number): Promise<Manifest | null> {
-    const runId = await this.store.getText(latestKey(courseId));
-    if (!runId) return null;
-    const raw = await this.store.getText(manifestKey(courseId, runId.trim()));
+    const latest = await this.store.getText(latestKey(courseId));
+    if (!latest) return null;
+    const runId = latest.trim();
+    const key = manifestKey(courseId, runId);
+    const raw = await this.store.getText(key);
     if (!raw) return null;
-    return parseManifest(raw);
+    const m = parseManifest(raw);
+    // The worker's own reader checks this too. A manifest naming another
+    // course or run is a mis-served or hand-copied object, and syncing it
+    // would tombstone the wrong course's files.
+    if (m.course_id !== courseId || m.run_id !== runId) {
+      throw new Error(`obsync: ${key} claims course ${m.course_id} run ${m.run_id}`);
+    }
+    return m;
   }
 
   previewCourse(m: Manifest): Preview {

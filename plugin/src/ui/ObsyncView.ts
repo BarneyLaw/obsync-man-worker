@@ -200,7 +200,9 @@ export class ObsyncView extends ItemView {
       cls: "obsync-muted",
       text:
         "Canvas has these and they were deliberately not pulled. Local rules are " +
-        "reversible in Setup; worker rules need a change on the server.",
+        "reversible in Setup; worker rules need a change on the server. Pending " +
+        "files were left for later by a scoped pull on the worker and arrive with " +
+        "its next full pull.",
     });
     const list = details.createDiv({ cls: "obsync-list" });
     for (const item of withheld.slice(0, MAX_ROWS)) {
@@ -301,6 +303,7 @@ function tagFor(i: PreviewItem): string {
   switch (i.action) {
     case "skip-local": return "your rules";
     case "skip-worker": return "worker";
+    case "deferred": return "pending";
     case "locked": return "locked";
     case "unavailable": return "failed";
     default: return "";
