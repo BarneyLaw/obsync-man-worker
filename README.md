@@ -132,8 +132,17 @@ make s3-test                         # Range GET, conformance, presign, a full w
 scripts/garage-dev.sh down           # removes the container and its data
 ```
 
-From PowerShell, after `up` has run once in Git Bash:
-`& "$env:ProgramFiles\Git\bin\bash.exe" scripts/garage-dev.sh env --ps | Out-String | Invoke-Expression`
+From PowerShell, use the wrapper. It runs the script under Git Bash in your
+session and sets `GARAGE_*` there:
+
+```powershell
+./scripts/garage-dev.ps1 up      # start (idempotent) and set GARAGE_* in this session
+./scripts/garage-dev.ps1 env     # a new terminal, Garage already running
+./scripts/garage-dev.ps1 down
+```
+
+Do not run `scripts/garage-dev.sh` directly from PowerShell: Windows opens the
+`.sh` in a separate window and returns before Garage is up.
 
 **Pointing the plugin at Garage.** The S3 API needs signed requests and the
 plugin holds no credentials, so it reads through one of two unsigned doors:
