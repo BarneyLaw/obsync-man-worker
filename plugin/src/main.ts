@@ -5,6 +5,7 @@ import { RemoteStore } from "./store";
 import { Syncer, notifyResult } from "./sync";
 import { ObsyncView, VIEW_TYPE_OBSYNC } from "./ui/ObsyncView";
 import { widenRightSidebar } from "./ui/layout";
+import { CourseCheck, checkCourses } from "./courses";
 
 export default class ObsyncPlugin extends Plugin {
   settings: ObsyncSettings = DEFAULT_SETTINGS;
@@ -15,6 +16,8 @@ export default class ObsyncPlugin extends Plugin {
   private running = false;
   private status = "idle";
   private statusListeners = new Set<(text: string) => void>();
+  /** The last course ID lookup, so Setup can show it again after a re-render. */
+  courseCheck?: { ids: number[]; results: CourseCheck[] };
 
   async onload() {
     const data = (await this.loadData()) as { settings?: ObsyncSettings } | null;
@@ -75,13 +78,18 @@ export default class ObsyncPlugin extends Plugin {
     await saveState(this, this.state, this.settings);
   }
 
-  makeSyncer(): Syncer | null {
+  /**
+   * @param opts.quiet - return null without a notice when setup is incomplete.
+   *   Only a pull the user asked for should nag; the panel and automatic pulls
+   *   explain themselves or stay silent.
+   */
+  makeSyncer(opts: { quiet?: boolean } = {}): Syncer | null {
     if (!this.settings.baseUrl) {
-      new Notice("obsync: set the store URL in the panel's Setup section first");
+      if (!opts.quiet) new Notice("obsync: set the store URL in the panel's Setup section first");
       return null;
     }
     if (this.settings.courses.length === 0) {
-      new Notice("obsync: add at least one course ID in the panel's Setup section");
+      if (!opts.quiet) new Notice("obsync: add at least one course ID in the panel's Setup section");
       return null;
     }
     const store = new RemoteStore({ baseUrl: this.settings.baseUrl, bucket: this.settings.bucket });
@@ -96,7 +104,7 @@ export default class ObsyncPlugin extends Plugin {
   async pullAll(opts: { manual?: boolean } = {}) {
     if (this.running) return;
     const mode = opts.manual === true ? "manual" : "automatic";
-    const s = this.makeSyncer();
+    const s = this.makeSyncer({ quiet: mode === "automatic" });
     if (!s) return;
     this.running = true;
     this.setStatus("syncing...");
@@ -126,6 +134,16 @@ export default class ObsyncPlugin extends Plugin {
     } finally {
       this.running = false;
     }
+  }
+
+  /** Look each course ID up in the store, for the Setup form. Never raises a notice. */
+  async checkCourses(ids: number[]): Promise<CourseCheck[]> {
+    if (!this.settings.baseUrl) {
+      return ids.map((id): CourseCheck => ({ id, status: "error", message: "set the store URL first" }));
+    }
+    const store = new RemoteStore({ baseUrl: this.settings.baseUrl, bucket: this.settings.bucket });
+    const s = new Syncer(this, store, this.settings.policy, this.state, this.settings);
+    return checkCourses(ids, (id) => s.fetchManifest(id));
   }
 
   currentStatus(): string {

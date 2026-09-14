@@ -179,6 +179,39 @@
   border-left: 1px solid var(--background-modifier-border);
 }
 
+/* Setup: one line per course ID after it is checked against the store. */
+.obsync-course-report {
+  display: flex;
+  flex-direction: column;
+  gap: var(--size-2-1);
+  padding-bottom: var(--size-4-2);
+  font-size: var(--font-ui-small);
+}
+
+.obsync-course-report-row {
+  display: flex;
+  align-items: center;
+  gap: var(--size-2-2);
+}
+
+.obsync-course-report-icon {
+  display: inline-flex;
+  flex: 0 0 auto;
+}
+
+.obsync-course-report-icon svg {
+  width: var(--icon-xs);
+  height: var(--icon-xs);
+}
+
+.obsync-ok {
+  color: var(--text-success);
+}
+
+.obsync-warning {
+  color: var(--text-warning);
+}
+
 .obsync-error {
   color: var(--text-error);
 }

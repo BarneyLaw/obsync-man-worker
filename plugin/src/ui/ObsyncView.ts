@@ -19,7 +19,7 @@ const AUTO_EXPAND_FILES = 12;
 
 /** What the plugin has to expose for the panel to drive it. */
 export type ObsyncHost = ObsyncPluginLike & {
-  makeSyncer(): Syncer | null;
+  makeSyncer(opts?: { quiet?: boolean }): Syncer | null;
   pullAll(opts?: { manual?: boolean }): Promise<void>;
   onStatus(cb: (text: string) => void): () => void;
   currentStatus(): string;
@@ -53,6 +53,10 @@ export class ObsyncView extends ItemView {
   private loading = false;
   private unsubscribe?: () => void;
   private statusEl?: HTMLElement;
+  // Which sections the user opened or closed, so a reload does not undo it.
+  private setupOpen = false;
+  private collapsedCourses = new Set<number>();
+  private openWithheld = new Set<number>();
 
   constructor(leaf: WorkspaceLeaf, private plugin: ObsyncHost) {
     super(leaf);
@@ -77,9 +81,13 @@ export class ObsyncView extends ItemView {
 
   /** Re-fetch every configured course's manifest, then re-render. */
   async refresh() {
-    const s = this.plugin.makeSyncer();
+    // Quiet: the panel explains an incomplete setup itself.
+    const s = this.plugin.makeSyncer({ quiet: true });
     this.syncer = s;
-    if (!s) return;
+    if (!s) {
+      this.render();
+      return;
+    }
     this.loading = true;
     this.render();
 
@@ -159,7 +167,12 @@ export class ObsyncView extends ItemView {
   }
 
   private renderCourse(parent: HTMLElement, id: number, st: CourseState) {
-    const details = parent.createEl("details", { cls: "obsync-course", attr: { open: "" } });
+    const details = parent.createEl("details", { cls: "obsync-course" });
+    details.open = !this.collapsedCourses.has(id);
+    details.addEventListener("toggle", () => {
+      if (details.open) this.collapsedCourses.delete(id);
+      else this.collapsedCourses.add(id);
+    });
     const name = st.manifest?.course_name ?? `Course ${id}`;
     details.createEl("summary", { text: name });
 
@@ -204,14 +217,19 @@ export class ObsyncView extends ItemView {
       this.updateCount(id);
     }
 
-    this.renderWithheld(details, p);
+    this.renderWithheld(details, id, p);
   }
 
-  private renderWithheld(parent: HTMLElement, p: Preview) {
+  private renderWithheld(parent: HTMLElement, id: number, p: Preview) {
     const withheld = p.items.filter((i) => !isPullable(i) && i.action !== "have");
     if (withheld.length === 0) return;
 
     const details = parent.createEl("details", { cls: "obsync-withheld" });
+    details.open = this.openWithheld.has(id);
+    details.addEventListener("toggle", () => {
+      if (details.open) this.openWithheld.add(id);
+      else this.openWithheld.delete(id);
+    });
     details.createEl("summary", { text: `Not included (${withheld.length})` });
     details.createEl("p", {
       cls: "obsync-muted",
@@ -401,6 +419,10 @@ export class ObsyncView extends ItemView {
 
   private renderSetup(root: HTMLElement) {
     const details = root.createEl("details", { cls: "obsync-setup" });
+    details.open = this.setupOpen;
+    details.addEventListener("toggle", () => {
+      this.setupOpen = details.open;
+    });
     details.createEl("summary", { text: "Setup" });
     const box = details.createDiv();
     // The same form the settings tab renders, so the two cannot drift. It is
