@@ -27,6 +27,12 @@ export interface CourseRecord {
   folder?: string;
   /** Manifest path -> record. */
   files: Record<string, FileRecord>;
+  /**
+   * Ticks the user changed in the panel, by manifest path: true to pull, false
+   * to leave out. Kept until the file is pulled, so an untick survives restarts
+   * and every automatic pull.
+   */
+  choices?: Record<string, boolean>;
 }
 
 export interface LocalState {

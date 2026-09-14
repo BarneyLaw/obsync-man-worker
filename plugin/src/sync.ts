@@ -5,7 +5,7 @@ import { Manifest, Entry, blobKey, latestKey, manifestKey, parseManifest, liveEn
 import { Policy } from "./policy";
 import { CourseRecord, FileRecord, LocalState, saveState } from "./state";
 import { RemoteStore, chunkSize, CHUNK_THRESHOLD } from "./store";
-import { preview, Preview } from "./preview";
+import { preview, Preview, PreviewItem, isPullable } from "./preview";
 import { courseFolderName } from "./folders";
 
 export interface SyncResult {
@@ -24,14 +24,20 @@ export interface SyncResult {
 /** Outcome of a single entry write. */
 type WriteOutcome = "written" | "conflict" | "adopted";
 
+export type PullMode = "manual" | "automatic";
+
 export interface SyncOptions {
   /**
-   * Put back files this device wrote that have since been deleted from the
-   * vault. True (the default) for pulls the user starts. False for the
-   * automatic pull on startup and on the interval: deleting a mirrored file
-   * must not be silently undone the next time Obsidian opens.
+   * manual (default): the user pressed a pull button. Write every selected
+   * item (see Syncer.isSelected), including deleted files they ticked.
+   *
+   * automatic: the pull on startup and on the interval. It only refreshes
+   * files this vault already has that changed in Canvas, and still respects an
+   * untick. It never brings in a file the user has not pulled, or has deleted.
+   *
+   * Both process tombstones and claim the run.
    */
-  restoreMissing?: boolean;
+  mode?: PullMode;
 }
 
 export interface SyncFolders {
@@ -151,14 +157,12 @@ export class Syncer {
   }
 
   /**
-   * Whether a pull has work: the worker published a run this device has not
-   * finished, or (only when restoring) files this device wrote have gone
-   * missing from the vault.
+   * Whether an automatic pull has work. It only refreshes files this vault
+   * already has, and only a run this device has not seen can change those.
    */
-  async needsSync(m: Manifest, opts: SyncOptions = {}): Promise<boolean> {
+  async needsSync(m: Manifest): Promise<boolean> {
     await this.migrateCourse(m);
-    if (this.state.lastRunId[String(m.course_id)] !== m.run_id) return true;
-    return (opts.restoreMissing ?? true) && (await this.missingFiles(m)).size > 0;
+    return this.state.lastRunId[String(m.course_id)] !== m.run_id;
   }
 
   previewCourse(m: Manifest, missing: ReadonlySet<string> = new Set()): Preview {
@@ -166,24 +170,46 @@ export class Syncer {
   }
 
   /**
-   * @param only - when present, restricts the pull to these paths. A partial
-   *   pull deliberately does NOT advance lastRunId and does NOT process
-   *   tombstones: the run is not finished, and claiming otherwise would make
-   *   pullAll skip the course and strand every unselected file.
+   * Whether the user wants a pullable item pulled: their own tick or untick if
+   * they made one; otherwise new and changed files start ticked, and files
+   * deleted from the vault start unticked, so a deletion is never undone
+   * without being asked.
    */
-  async syncCourse(m: Manifest, only?: Set<string>, opts: SyncOptions = {}): Promise<SyncResult> {
+  isSelected(m: Manifest, item: PreviewItem): boolean {
+    const choice = this.course(m).choices?.[item.entry.path];
+    if (choice !== undefined) return choice;
+    return item.action === "download" || item.action === "update";
+  }
+
+  /** Paths of the pullable items currently selected. */
+  selection(m: Manifest, p: Preview): Set<string> {
+    return new Set(p.items.filter((i) => isPullable(i) && this.isSelected(m, i)).map((i) => i.entry.path));
+  }
+
+  /**
+   * Record the user ticking or unticking paths. Remembered until each file is
+   * pulled, so it holds across restarts and automatic pulls.
+   */
+  async choose(m: Manifest, paths: readonly string[], on: boolean): Promise<void> {
+    const course = this.course(m);
+    const choices = (course.choices ??= {});
+    for (const path of paths) choices[path] = on;
+    await saveState(this.plugin, this.state, this.settings);
+  }
+
+  async syncCourse(m: Manifest, opts: SyncOptions = {}): Promise<SyncResult> {
     const res: SyncResult = {
       added: 0, updated: 0, restored: 0, removed: 0, conflicts: [], skipped: 0, errors: [], adopted: 0,
     };
-    const restore = opts.restoreMissing ?? true;
+    const automatic = opts.mode === "automatic";
     await this.migrateCourse(m);
     const p = this.previewCourse(m, await this.missingFiles(m));
-    const files = this.course(m).files;
-    const partial = only !== undefined;
+    const course = this.course(m);
+    const files = course.files;
 
     for (const item of p.items) {
-      if (only && !only.has(item.entry.path)) continue;
-      if (item.action === "restore" && !restore) {
+      const wanted = isPullable(item) && this.isSelected(m, item) && (!automatic || item.action === "update");
+      if (!wanted) {
         res.skipped++;
         continue;
       }
@@ -198,6 +224,9 @@ export class Syncer {
             else if (item.action === "restore") res.restored++;
             else if (item.action === "download") res.added++;
             else res.updated++;
+            // The tick is spent once the file is in the vault: delete it later
+            // and it starts unticked again.
+            if (outcome !== "conflict" && course.choices) delete course.choices[item.entry.path];
             break;
           }
           default:
@@ -208,21 +237,30 @@ export class Syncer {
       }
     }
 
-    if (!partial) {
-      for (const e of m.entries) {
-        if (e.state === "deleted" && files[e.path]) {
-          try {
-            await this.trash(m, e.path);
-            res.removed++;
-          } catch (err) {
-            res.errors.push(`${e.path}: ${String(err)}`);
-          }
+    // Tombstones only touch files this vault has, so every pull processes them.
+    for (const e of m.entries) {
+      if (e.state === "deleted" && files[e.path]) {
+        try {
+          await this.trash(m, e.path);
+          res.removed++;
+        } catch (err) {
+          res.errors.push(`${e.path}: ${String(err)}`);
         }
       }
-      // Only a complete pass may claim the run. Marking a partial pull as done
-      // would trip the "nothing new since last look" guard in pullAll.
-      this.state.lastRunId[String(m.course_id)] = m.run_id;
     }
+
+    // Forget ticks for files Canvas no longer offers.
+    if (course.choices) {
+      const live = new Set(liveEntries(m).map((e) => e.path));
+      for (const path of Object.keys(course.choices)) {
+        if (!live.has(path)) delete course.choices[path];
+      }
+    }
+
+    // Every pull claims the run, including one that left files unticked: those
+    // are meant to stay out until the user ticks them, so there is nothing left
+    // for an automatic pull to finish.
+    this.state.lastRunId[String(m.course_id)] = m.run_id;
 
     await saveState(this.plugin, this.state, this.settings);
     return res;
@@ -434,6 +472,8 @@ export function uniquify(path: string, n: number): string {
 }
 
 export function notifyResult(r: SyncResult) {
+  const changed = r.added + r.updated + r.restored + r.removed + r.adopted;
+  if (changed + r.conflicts.length + r.errors.length === 0) return;
   const parts = [`${r.added} new`, `${r.updated} updated`, `${r.removed} removed`];
   if (r.restored) parts.push(`${r.restored} restored`);
   if (r.adopted) parts.push(`${r.adopted} already present`);

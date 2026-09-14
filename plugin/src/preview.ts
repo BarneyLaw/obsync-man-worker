@@ -24,6 +24,11 @@ export interface PreviewItem {
   reason: string;
 }
 
+/** Items a pull can write: new, changed, or deleted from the vault. */
+export function isPullable(item: PreviewItem): boolean {
+  return item.action === "download" || item.action === "update" || item.action === "restore";
+}
+
 export interface Preview {
   items: PreviewItem[];
   /** Everything a manual pull would write: downloads, updates and restores. */

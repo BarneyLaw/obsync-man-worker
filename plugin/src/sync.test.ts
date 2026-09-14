@@ -364,14 +364,17 @@ describe("upgrading from one shared folder (state version 1)", () => {
     expect(store.gets).toEqual([]);
   });
 
-  it("still pulls a version 1 file the user had deleted", async () => {
+  it("offers a version 1 file the user had deleted, restored once ticked", async () => {
     const { adapter, state, make } = build(["aaa"]);
     state.legacyFiles["a.pdf"] = { sha256: hashOf("aaa"), size: 3, writtenAt: 1000 };
     const m = manifest([entry("a.pdf", "aaa")]);
     state.lastRunId["42"] = m.run_id;
     const s = make(state);
 
-    expect(await s.needsSync(m)).toBe(true);
+    expect(await s.needsSync(m)).toBe(false);
+    expect(s.previewCourse(m, await s.missingFiles(m)).items[0]?.action).toBe("restore");
+
+    await s.choose(m, ["a.pdf"], true);
     const res = await s.syncCourse(m);
 
     expect(res.restored).toBe(1);
@@ -469,101 +472,160 @@ describe("writeEntry: not destroying local data", () => {
   });
 });
 
-describe("partial vs full pulls", () => {
-  const two = () => manifest([entry("a.pdf", "aaa"), entry("b.pdf", "bbb")]);
+describe("what gets pulled", () => {
+  const two = (run = "run-2") => manifest([entry("a.pdf", "aaa"), entry("b.pdf", "bbb")], run);
 
-  it("a full pull claims the run", async () => {
-    const { state, make } = build(["aaa", "bbb"]);
-    await make().syncCourse(two());
+  it("a manual pull writes new files, which start ticked, and claims the run", async () => {
+    const { adapter, state, make } = build(["aaa", "bbb"]);
+    const res = await make().syncCourse(two());
+
+    expect(res.added).toBe(2);
+    expect(adapter.files.has(`${C}/b.pdf`)).toBe(true);
     expect(state.lastRunId["42"]).toBe("run-2");
   });
 
-  it("a partial pull does NOT claim the run", async () => {
-    // Otherwise pullAll's "nothing new since last look" guard skips the course
-    // forever and the unselected files are stranded.
-    const { adapter, state, make } = build(["aaa", "bbb"]);
-    const res = await make().syncCourse(two(), new Set(["a.pdf"]));
+  it("never pulls a file the user unticked, and remembers the untick", async () => {
+    const { adapter, state, plugin, make } = build(["aaa", "bbb"]);
+    const s = make();
+    await s.choose(two(), ["b.pdf"], false);
+    expect((plugin.saved as { state: LocalState }).state.courses["42"]?.choices).toEqual({ "b.pdf": false });
 
+    const res = await s.syncCourse(two());
     expect(res.added).toBe(1);
-    expect(adapter.files.has(`${C}/a.pdf`)).toBe(true);
     expect(adapter.files.has(`${C}/b.pdf`)).toBe(false);
-    expect(state.lastRunId["42"]).toBeUndefined();
+
+    // Still unticked on the next pull, from a fresh Syncer as after a restart.
+    expect((await make(state).syncCourse(two("run-3"))).added).toBe(0);
+    expect(adapter.files.has(`${C}/b.pdf`)).toBe(false);
   });
 
-  it("a partial pull does not act on tombstones", async () => {
-    const { adapter, state, make } = build(["aaa"]);
+  it("claims the run even when files were left unticked", async () => {
+    // Otherwise the next automatic pull would treat the run as unfinished.
+    const { state, make } = build(["aaa", "bbb"]);
+    const s = make();
+    await s.choose(two(), ["b.pdf"], false);
+    await s.syncCourse(two());
+    expect(state.lastRunId["42"]).toBe("run-2");
+    expect(await s.needsSync(two())).toBe(false);
+  });
+
+  // The reported bug: files the user left out came in on the next startup.
+  it("an automatic pull never brings in a file this vault does not have", async () => {
+    const { adapter, store, make } = build(["aaa", "bbb"]);
+    const res = await make().syncCourse(two(), { mode: "automatic" });
+
+    expect(res.added).toBe(0);
+    expect(adapter.files.has(`${C}/a.pdf`)).toBe(false);
+    expect(store.gets).toEqual([]);
+  });
+
+  it("an automatic pull refreshes files this vault has that changed in Canvas", async () => {
+    const { adapter, make } = build(["aaa", "aaa v2", "bbb"]);
+    const s = make();
+    await s.syncCourse(manifest([entry("a.pdf", "aaa")], "run-1"));
+    const next = manifest([entry("a.pdf", "aaa v2"), entry("b.pdf", "bbb")], "run-2");
+
+    expect(await s.needsSync(next)).toBe(true);
+    const res = await s.syncCourse(next, { mode: "automatic" });
+
+    expect(res.updated).toBe(1);
+    expect(res.added).toBe(0);
+    expect(adapter.read(`${C}/a.pdf`)).toBe("aaa v2");
+    expect(adapter.files.has(`${C}/b.pdf`)).toBe(false);
+  });
+
+  it("an automatic pull skips a change the user unticked", async () => {
+    const { adapter, make } = build(["aaa", "aaa v2"]);
+    const s = make();
+    await s.syncCourse(manifest([entry("a.pdf", "aaa")], "run-1"));
+    const next = manifest([entry("a.pdf", "aaa v2")], "run-2");
+    await s.choose(next, ["a.pdf"], false);
+
+    const res = await s.syncCourse(next, { mode: "automatic" });
+
+    expect(res.updated).toBe(0);
+    expect(adapter.read(`${C}/a.pdf`)).toBe("aaa");
+  });
+
+  it("a tick is spent once the file is pulled", async () => {
+    const { state, make } = build(["aaa"]);
+    const s = make();
+    const m = manifest([entry("a.pdf", "aaa")]);
+    await s.choose(m, ["a.pdf"], true);
+    await s.syncCourse(m);
+    expect(state.courses["42"]?.choices).toEqual({});
+  });
+
+  it("forgets ticks for files Canvas no longer offers", async () => {
+    const { state, make } = build(["aaa"]);
+    const s = make();
+    await s.choose(two(), ["b.pdf"], false);
+    await s.syncCourse(manifest([entry("a.pdf", "aaa")], "run-3"));
+    expect(state.courses["42"]?.choices).toEqual({});
+  });
+
+  it("every pull, automatic included, moves removed files to trash", async () => {
+    const { adapter, state, make } = build([]);
     adapter.write(`${C}/gone.pdf`, "old");
     files(state)["gone.pdf"] = { sha256: hashOf("old"), size: 3, writtenAt: Date.now() };
+    const m = manifest([entry("gone.pdf", "old", { state: "deleted" })]);
 
-    const m = manifest([entry("a.pdf", "aaa"), entry("gone.pdf", "old", { state: "deleted" })]);
-    const res = await make(state).syncCourse(m, new Set(["a.pdf"]));
+    const res = await make(state).syncCourse(m, { mode: "automatic" });
 
-    expect(res.removed).toBe(0);
-    expect(adapter.files.has(`${C}/gone.pdf`)).toBe(true);
+    expect(res.removed).toBe(1);
+    expect(adapter.files.has(`${C}/gone.pdf`)).toBe(false);
   });
 });
 
 describe("files deleted from the vault", () => {
-  // The first reported bug: pull, delete the files, and the panel says
-  // everything is up to date forever, because the record said so and the run
-  // had not changed.
-  it("are found missing, offered again, and restored by a manual pull", async () => {
+  // First reported bug: pull, delete the files, and the panel said everything
+  // was up to date forever, because the record said so.
+  it("are offered again, unticked, and restored only once ticked", async () => {
     const { adapter, make } = build(["aaa", "bbb"]);
     const m = manifest([entry("a.pdf", "aaa"), entry("Week 1/b.pdf", "bbb")]);
     const s = make();
     await s.syncCourse(m);
-    expect(await s.needsSync(m)).toBe(false);
 
     adapter.files.delete(`${C}/a.pdf`);
     adapter.files.delete(`${C}/Week 1/b.pdf`);
 
     const missing = await s.missingFiles(m);
     expect([...missing].sort()).toEqual(["Week 1/b.pdf", "a.pdf"]);
-    expect(await s.needsSync(m)).toBe(true);
-    const actions = s.previewCourse(m, missing).items.map((i) => i.action);
-    expect(actions).toEqual(["restore", "restore"]);
+    const p = s.previewCourse(m, missing);
+    expect(p.items.map((i) => i.action)).toEqual(["restore", "restore"]);
+    expect(s.selection(m, p).size).toBe(0);
+    expect((await s.syncCourse(m)).restored).toBe(0);
 
+    await s.choose(m, ["a.pdf"], true);
     const res = await s.syncCourse(m);
 
-    expect(res.restored).toBe(2);
+    expect(res.restored).toBe(1);
     expect(res.conflicts).toEqual([]);
     expect(adapter.read(`${C}/a.pdf`)).toBe("aaa");
-    expect(adapter.read(`${C}/Week 1/b.pdf`)).toBe("bbb");
-    expect(await s.needsSync(m)).toBe(false);
-  });
+    expect(adapter.files.has(`${C}/Week 1/b.pdf`)).toBe(false);
 
-  // The second reported bug: after deleting a pull, every reopen of Obsidian
-  // pulled it all back, because the startup pull restored missing files.
-  it("are left alone by automatic pulls", async () => {
-    const { adapter, store, make } = build(["aaa"]);
-    const m = manifest([entry("a.pdf", "aaa")]);
-    const s = make();
-    await s.syncCourse(m);
+    // The tick is spent: delete it again and it starts unticked again.
     adapter.files.delete(`${C}/a.pdf`);
-    store.gets.length = 0;
-
-    expect(await s.needsSync(m, { restoreMissing: false })).toBe(false);
-    const res = await s.syncCourse(m, undefined, { restoreMissing: false });
-
-    expect(res.restored).toBe(0);
-    expect(res.skipped).toBe(1);
-    expect(adapter.files.has(`${C}/a.pdf`)).toBe(false);
-    expect(store.gets).toEqual([]);
+    expect(s.selection(m, s.previewCourse(m, await s.missingFiles(m))).size).toBe(0);
   });
 
-  it("stay deleted when an automatic pull fetches a new run", async () => {
-    const { adapter, make } = build(["aaa", "new"]);
+  // Second reported bug: after deleting a pull, every reopen of Obsidian
+  // pulled it all back.
+  it("are never restored by an automatic pull, ticked or not, new run or not", async () => {
+    const { adapter, store, make } = build(["aaa"]);
     const s = make();
     await s.syncCourse(manifest([entry("a.pdf", "aaa")], "run-1"));
     adapter.files.delete(`${C}/a.pdf`);
+    store.gets.length = 0;
 
-    const next = manifest([entry("a.pdf", "aaa"), entry("new.pdf", "new")], "run-2");
-    expect(await s.needsSync(next, { restoreMissing: false })).toBe(true);
-    const res = await s.syncCourse(next, undefined, { restoreMissing: false });
+    const next = manifest([entry("a.pdf", "aaa")], "run-2");
+    await s.choose(next, ["a.pdf"], true);
+    expect(await s.needsSync(next)).toBe(true);
+    const res = await s.syncCourse(next, { mode: "automatic" });
 
-    expect(res.added).toBe(1);
-    expect(adapter.read(`${C}/new.pdf`)).toBe("new");
+    expect(res.restored).toBe(0);
     expect(adapter.files.has(`${C}/a.pdf`)).toBe(false);
+    expect(store.gets).toEqual([]);
   });
 
   it("only counts files this device recorded writing", async () => {

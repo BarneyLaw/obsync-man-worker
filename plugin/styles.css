@@ -154,6 +154,25 @@
   font-weight: var(--font-medium);
 }
 
+.obsync-view .obsync-tree-all {
+  padding-bottom: var(--size-2-2);
+  border-bottom: 1px solid var(--background-modifier-border);
+  margin-bottom: var(--size-2-1);
+}
+
+/* What a pull would do to each file, readable at a glance. */
+.obsync-view .obsync-tag-new {
+  color: var(--text-accent);
+}
+
+.obsync-view .obsync-tag-changed {
+  color: var(--text-warning);
+}
+
+.obsync-view .obsync-tag-missing {
+  color: var(--text-error);
+}
+
 .obsync-view .obsync-tree-children {
   margin-left: calc(var(--icon-xs) / 2);
   padding-left: var(--size-4-2);

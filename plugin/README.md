@@ -27,9 +27,9 @@ Everything happens in the sidebar panel. Click the cloud icon in the left
 ribbon (or run **Open panel**) and it opens on the right:
 
 - **Status** and the two global actions, Pull now and Refresh.
-- **One section per course**: how much is pending, and a folder tree of exactly
-  what will be written. Untick a file, or a whole folder, and press Pull
-  selected. Nothing is downloaded until you do.
+- **One section per course**: how much is new, changed or missing, and a folder
+  tree of exactly what will be written. Tick or untick files, folders or
+  **All files**, and press Pull selected. Nothing is downloaded until you do.
 - **Not included**, per course: everything Canvas has that was withheld, with
   the reason. A file you can see in Canvas that silently does not appear in
   your vault is the worst possible outcome, so nothing is hidden from you.
@@ -135,10 +135,21 @@ links → Excluded files** if search gets noisy.
 On load (after a delay), on an interval, and manually from the panel. **Never on vault file
 change** — a mirror that reacts to your own edits is a feedback loop.
 
-A mirrored file you delete from the vault stays deleted: the automatic pulls on
-startup and on the interval leave it alone, even when the worker publishes a
-new run. The panel lists it as "missing from the vault", and **Pull now** or
-**Pull selected** puts it back.
+**Nothing enters the vault unless it is ticked and you press a pull button.**
+
+| | Pull now / Pull selected | Automatic (startup, interval) |
+|---|---|---|
+| New file, ticked (the default) | pulled | not pulled |
+| File you unticked | not pulled | not pulled |
+| Changed in Canvas, already in the vault | pulled if ticked | refreshed unless unticked |
+| Deleted from the vault (starts unticked) | pulled only if you tick it | never |
+| Removed from Canvas | moved to trash | moved to trash |
+
+Ticks and unticks are remembered per device until the file is pulled, so an
+untick survives restarts. In the panel, each file is tagged **new** (not in
+this vault yet), **changed** (Canvas has a newer version than your copy) or
+**missing** (pulled before, then deleted from the vault). Unticking a folder,
+or **All files**, unticks everything beneath it.
 
 ## Development
 

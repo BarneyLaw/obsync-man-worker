@@ -90,12 +90,12 @@ export default class ObsyncPlugin extends Plugin {
 
   /**
    * @param opts.manual - the user asked for this pull (button or command), so
-   *   files they deleted from the vault are put back. The automatic pulls on
-   *   startup and on the interval leave those deletions alone.
+   *   everything ticked in the panel is written. The automatic pulls on startup
+   *   and on the interval only refresh files the vault already has.
    */
   async pullAll(opts: { manual?: boolean } = {}) {
     if (this.running) return;
-    const restoreMissing = opts.manual === true;
+    const mode = opts.manual === true ? "manual" : "automatic";
     const s = this.makeSyncer();
     if (!s) return;
     this.running = true;
@@ -108,10 +108,10 @@ export default class ObsyncPlugin extends Plugin {
         try {
           const m = await s.fetchManifest(courseId);
           if (!m) continue;
-          // Skip work when the worker has not published since we last looked
-          // and, for a manual pull, nothing this device wrote has gone missing.
-          if (!(await s.needsSync(m, { restoreMissing }))) continue;
-          notifyResult(await s.syncCourse(m, undefined, { restoreMissing }));
+          // An automatic pull has nothing to refresh until the worker publishes
+          // a run this device has not seen.
+          if (mode === "automatic" && !(await s.needsSync(m))) continue;
+          notifyResult(await s.syncCourse(m, { mode }));
         } catch (e) {
           failed.push(courseId);
           console.error(`obsync: course ${courseId} failed`, e);
