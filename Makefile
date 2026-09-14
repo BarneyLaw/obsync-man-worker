@@ -14,11 +14,11 @@ courses: build
 	./bin/obsync-worker courses -probe
 # Full pipeline into a local directory. No Garage, no cluster.
 run-dev: build
-	./bin/obsync-worker run -rules=deploy/rules.json -fs-store=./.obsync-store
+	./bin/obsync-worker run -rules=deploy/apps/obsync-worker/rules.json -fs-store=./.obsync-store
 	./bin/obsync -fs-store=./.obsync-store ls
 # Manual pull of one course: make pull-dev COURSE=CS3103 [DRY=1]
 pull-dev: build
-	./bin/obsync-worker pull -rules=deploy/rules.json -fs-store=./.obsync-store -course=$(COURSE) $(if $(DRY),-dry-run)
+	./bin/obsync-worker pull -rules=deploy/apps/obsync-worker/rules.json -fs-store=./.obsync-store -course=$(COURSE) $(if $(DRY),-dry-run)
 # Read-only HTTP view of the dev store; point the plugin's base URL at it.
 serve-dev: build
 	./bin/obsync -fs-store=./.obsync-store serve
