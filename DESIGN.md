@@ -303,9 +303,13 @@ Namespace `obsync`, everything through Argo.
 
 **Garage.** StatefulSet, 3 replicas, `podAntiAffinity` by hostname (co-locating
 two pods defeats replication), headless service for RPC on 3901, ClusterIP for
-S3 on 3900 and admin on 3903. Metadata on `local-path` PVs pinned per node,
-**never** on a replicated volume: Garage replicates at the application layer and
-replicating underneath is pure waste plus worse metadata latency.
+S3 on 3900 and admin on 3903. Volumes on a Longhorn class with **one**
+replica, `strict-local`, **never** on the 3-replica default: Garage replicates
+at the application layer, and replicating underneath is pure waste (9 copies)
+plus a second rebuild on every reboot. One replica rather than `local-path` buys
+enforced sizes, online expansion and Longhorn's visibility, at the cost of
+Longhorn's `node-drain-policy` needing `allow-if-replica-is-stopped` so kured
+can still drain those nodes.
 `rpc_public_addr` must be the stable pod DNS name or the nodes never form a
 layout.
 

@@ -9,6 +9,7 @@ resources:
                             # and ArgoCD go Unknown. That is the correct failure
                             # mode; a placeholder would sync Healthy and then
                             # CrashLoop on decrypt.
+  - storageclass.yaml       # cluster-scoped; the namespace transformer skips it
   - statefulset.yaml
   - service.yaml
   - servicemonitor.yaml
