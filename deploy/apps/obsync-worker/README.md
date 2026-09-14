@@ -32,7 +32,7 @@ kubectl create secret generic obsync-worker \
   --from-literal=garage-access-key='GK...' \
   --from-literal=garage-secret-key='...' \
   --dry-run=client -o yaml \
-| kubeseal --cert sealed-secrets.pem --format yaml \
+| kubeseal --cert sealed-secrets-pub.pem --format yaml \
   > apps/obsync-worker/sealed-secret.yaml
 
 shred -u canvas-token.txt
@@ -69,6 +69,29 @@ does not cover Jobs made this way, but the worker takes a lease in the store
 and the second of two overlapping runs exits 3. On Garage that lease is
 best-effort (Garage ignores `If-None-Match`), so avoid starting one in the
 minutes around 18:17.
+
+### Only some courses, every day
+
+Add `-course` to the CronJob's `args` in `cronjob.yaml`, commit and push:
+
+```yaml
+args:
+  - run
+  - -course=CS3103,LAG1201
+  - -rules=/etc/obsync/rules.json
+  - -tmp-dir=/tmp
+  - -lock-ttl=3h
+```
+
+Entries are course codes (case-insensitive, or one half of a cross-listed
+code like `CS2103T`) or numeric ids. `obsync-worker courses` lists what the
+token can see. Remove the line to go back to every active course.
+
+A code that no longer matches an active course, typically because its semester
+ended, is logged as `run.course_selector_unresolved`. The other courses still
+sync, but the run exits 1 and `ObsyncWorkerLastRunFailed` fires until the list
+is edited. Needs an image built from obsync-man-worker with `run -course`;
+older images exit 2 on the flag.
 
 ### One course, or part of one
 
@@ -111,6 +134,7 @@ Swap `ls` for `preview <course-id>`, `log <course-id>`, or `gc` (a dry run;
 | What | Where | Takes effect |
 |---|---|---|
 | Schedule | `schedule` in `cronjob.yaml`, Asia/Singapore time | next sync |
+| Courses | `-course=` in the `cronjob.yaml` args (above) | next run |
 | Worker rules | `rules.json`: keep these to hard caps, aggressive filtering belongs in the plugin | next run |
 | Pause | `suspend: true` in `cronjob.yaml`. `kubectl patch` is reverted by selfHeal | next sync |
 | Canvas token | reseal step 1 | next run |

@@ -62,6 +62,15 @@ spec:
               imagePullPolicy: IfNotPresent
               args:
                 - run
+                # Only these courses, by code (CS3103, or one half of a
+                # cross-listed CS2103/CS2103T) or numeric id, comma-separated.
+                # Without it every active course is pulled. A code that no
+                # longer resolves, e.g. after its semester ends, fails the run
+                # once the other courses have synced, and
+                # ObsyncWorkerLastRunFailed fires until the list is edited.
+                # `obsync-worker courses` prints what the token can see.
+                # - -course=CS3103,LAG1201
+                - -course=93794,94846,93610
                 - -rules=/etc/obsync/rules.json
                 - -tmp-dir=/tmp
                 - -lock-ttl=3h

@@ -26,6 +26,9 @@ rpc_bind_addr = "[::]:3901"
 # Service's DNS names, resolved again on every start, so a pod that returns on a
 # new IP rejoins with no manual step.
 #
+# Without this list the cluster does not survive its first rollout: the last
+# pod to restart knows only its peers' old pod IPs and stays NotReady.
+#
 # bootstrap_peers = [
 #   "<garage-0 node id>@garage-0.garage-rpc.obsync.svc.cluster.local:3901",
 #   "<garage-1 node id>@garage-1.garage-rpc.obsync.svc.cluster.local:3901",

@@ -7,6 +7,11 @@ backups — separate cluster, separate RPC secret, separate failure domain.
 The manifests get you running pods. Forming the cluster takes the steps below,
 in order; only steps 1 and 5 end in a commit.
 
+From Git Bash on Windows, run `export MSYS_NO_PATHCONV=1` first. Otherwise
+Git Bash rewrites `/garage` in `kubectl exec ... -- /garage` into
+`C:/Program Files/Git/garage` and every exec fails with `no such file or
+directory`.
+
 ---
 
 ## 0. Prerequisite: Longhorn drain policy
@@ -123,12 +128,20 @@ kubectl -n obsync exec garage-0 -- /garage layout apply --version 1
 Within a poll cycle all three pods go `1/1 Ready`, and `garage status` shows
 each node with its zone and capacity.
 
-## 5. Commit the peers
+## 5. Commit the peers (do not skip)
 
-The connections from step 3 live only in each node's peer cache. That survives
-a restart, but not every pod coming back on a new IP at once, after which no
-node knows where the others are. Uncomment `bootstrap_peers` in `garage.toml`,
-fill in the three IDs, and commit.
+The connections from step 3 live only in each node's peer cache, which stores
+pod IPs. Every pod restart changes its IP. In a rolling update the last pod to
+restart comes back knowing only the other two's OLD addresses. They have moved,
+and they only know its old address too. That pod stays `0/1 Ready`, with
+`Could not reach quorum` and `connect to 10.42.x.y:3901 timed out` in its logs.
+Any change to `garage.toml` causes such a rollout, even one that only converts
+the line endings.
+
+Uncomment `bootstrap_peers` in `garage.toml`, fill in the three full IDs from
+step 3, and commit. Peers are then found by DNS name on every start. Keep the
+file's line endings LF: an editor that saves it as CRLF produces a new
+ConfigMap hash and a rollout that changes nothing.
 
 ```bash
 git add apps/garage-obsync/garage.toml && git commit && git push
@@ -180,6 +193,11 @@ resolve, and nothing serves that zone.
 - **No Longhorn backups for these volumes.** The store is a cache Canvas can
   refill, and three 75Gi volumes over NFS is a lot of backup for no recovery
   value. Do not add them to a recurring backup job.
+- **A node stuck `0/1 Ready` after a rollout**, listed under FAILED NODES by the
+  other two, has lost track of its peers' addresses (step 5). Reconnect it by
+  DNS name from the stuck pod; the others learn its new address in return:
+  `kubectl -n obsync exec garage-N -- /garage node connect <id>@garage-M.garage-rpc.obsync.svc.cluster.local:3901`
+  for each other node M. Then check that `bootstrap_peers` is really set.
 - **Config edits roll the pods.** `garage.toml` is a `configMapGenerator`, so a
   commit produces a new ConfigMap name and a rolling restart. That is deliberate
   (subPath mounts never pick up in-place ConfigMap changes).

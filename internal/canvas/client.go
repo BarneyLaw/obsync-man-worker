@@ -394,11 +394,22 @@ func redactErr(err error) string {
 // code, or one part of a cross-listed code like "CS2103T") to courses. Every
 // selector must match exactly one course.
 func SelectCourses(all []Course, wanted []string) ([]Course, error) {
+	out, problems := ResolveCourses(all, wanted)
+	if len(problems) > 0 {
+		return nil, problems[0]
+	}
+	return out, nil
+}
+
+// ResolveCourses is SelectCourses that keeps going. A selector matching no
+// course, or more than one, is reported in problems and left out; the others
+// still resolve. The scheduled run uses it so that a course dropping off Canvas
+// at the end of a semester does not stop the rest from syncing.
+func ResolveCourses(all []Course, wanted []string) (out []Course, problems []error) {
 	if len(wanted) == 0 {
 		return all, nil
 	}
 	picked := map[int64]bool{}
-	var out []Course
 	for _, w := range wanted {
 		w = strings.TrimSpace(w)
 		if w == "" {
@@ -412,17 +423,19 @@ func SelectCourses(all []Course, wanted []string) ([]Course, error) {
 		}
 		switch len(hits) {
 		case 0:
-			return nil, fmt.Errorf("no active course matches %q (available: %s)", w, describeCourses(all))
+			problems = append(problems, fmt.Errorf("no active course matches %q (available: %s)", w, describeCourses(all)))
+			continue
 		case 1:
 		default:
-			return nil, fmt.Errorf("course %q is ambiguous, it matches %s; use the numeric id", w, describeCourses(hits))
+			problems = append(problems, fmt.Errorf("course %q is ambiguous, it matches %s; use the numeric id", w, describeCourses(hits)))
+			continue
 		}
 		if !picked[hits[0].ID] {
 			picked[hits[0].ID] = true
 			out = append(out, hits[0])
 		}
 	}
-	return out, nil
+	return out, problems
 }
 
 func courseMatches(c Course, w string) bool {

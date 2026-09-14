@@ -268,3 +268,24 @@ func TestSelectCourses(t *testing.T) {
 		t.Fatalf("ambiguous selector: %v", err)
 	}
 }
+
+func TestResolveCoursesKeepsGoing(t *testing.T) {
+	all := []Course{
+		{ID: 93794, Code: "CS3103"},
+		{ID: 94846, Code: "LAG1201"},
+		{ID: 1, Code: "X/A"},
+		{ID: 2, Code: "Y/A"},
+	}
+	got, problems := ResolveCourses(all, []string{"CS9999", "lag1201", "A", "CS3103"})
+	if len(got) != 2 || got[0].ID != 94846 || got[1].ID != 93794 {
+		t.Fatalf("resolved courses: got %+v", got)
+	}
+	if len(problems) != 2 ||
+		!strings.Contains(problems[0].Error(), "no active course matches \"CS9999\"") ||
+		!strings.Contains(problems[1].Error(), "ambiguous") {
+		t.Fatalf("problems: got %v", problems)
+	}
+	if got, problems := ResolveCourses(all, nil); len(got) != len(all) || problems != nil {
+		t.Fatalf("no selectors must select every course: got %+v, %v", got, problems)
+	}
+}
