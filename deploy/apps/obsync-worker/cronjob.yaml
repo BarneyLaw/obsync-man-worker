@@ -70,6 +70,7 @@ spec:
                 # ObsyncWorkerLastRunFailed fires until the list is edited.
                 # `obsync-worker courses` prints what the token can see.
                 # - -course=CS3103,LAG1201
+                - -course=93794,94846,93610
                 - -rules=/etc/obsync/rules.json
                 - -tmp-dir=/tmp
                 - -lock-ttl=3h
