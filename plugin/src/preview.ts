@@ -13,6 +13,8 @@ export interface PreviewItem {
   action:
     | "download"
     | "update"
+    /** Written by this device, since deleted from the vault. Only a user-started pull puts it back. */
+    | "restore"
     | "have"
     | "skip-local"
     | "skip-worker"
@@ -24,6 +26,7 @@ export interface PreviewItem {
 
 export interface Preview {
   items: PreviewItem[];
+  /** Everything a manual pull would write: downloads, updates and restores. */
   toDownload: number;
   bytesToDownload: number;
   alreadyHave: number;
@@ -57,6 +60,7 @@ export function preview(
     switch (item.action) {
       case "download":
       case "update":
+      case "restore":
         out.toDownload++;
         out.bytesToDownload += e.size;
         break;
@@ -107,10 +111,10 @@ function classify(
   const note = e.reason ? ` (${e.reason})` : "";
   const known = files[e.path];
   if (known && missing.has(e.path)) {
-    // Recorded as written, but gone from the vault: deleted by the user, or a
-    // restored vault without it. A mirror puts it back. Keeping a file out for
-    // good is what local rules are for.
-    return { entry: e, action: "download", reason: `missing from the vault, ${humanBytes(e.size)}${note}` };
+    // Recorded as written, but gone from the vault: usually the user deleted
+    // it. Offered in the panel, but automatic pulls leave it alone so a
+    // deletion is not undone behind the user's back.
+    return { entry: e, action: "restore", reason: `missing from the vault, ${humanBytes(e.size)}${note}` };
   }
   if (known && known.sha256 === e.sha256) {
     return { entry: e, action: "have", reason: `up to date${note}` };

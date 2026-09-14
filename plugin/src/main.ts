@@ -36,7 +36,7 @@ export default class ObsyncPlugin extends Plugin {
       id: "open-panel", name: "Open panel",
       callback: () => void this.activateView(),
     });
-    this.addCommand({ id: "pull", name: "Pull now", callback: () => void this.pullAll() });
+    this.addCommand({ id: "pull", name: "Pull now", callback: () => void this.pullAll({ manual: true }) });
 
     // Delay on load so plugin startup is not blocked by network.
     this.app.workspace.onLayoutReady(() => {
@@ -88,8 +88,14 @@ export default class ObsyncPlugin extends Plugin {
     return new Syncer(this, store, this.settings.policy, this.state, this.settings);
   }
 
-  async pullAll() {
+  /**
+   * @param opts.manual - the user asked for this pull (button or command), so
+   *   files they deleted from the vault are put back. The automatic pulls on
+   *   startup and on the interval leave those deletions alone.
+   */
+  async pullAll(opts: { manual?: boolean } = {}) {
     if (this.running) return;
+    const restoreMissing = opts.manual === true;
     const s = this.makeSyncer();
     if (!s) return;
     this.running = true;
@@ -103,9 +109,9 @@ export default class ObsyncPlugin extends Plugin {
           const m = await s.fetchManifest(courseId);
           if (!m) continue;
           // Skip work when the worker has not published since we last looked
-          // and nothing this device wrote has gone missing from the vault.
-          if (!(await s.needsSync(m))) continue;
-          notifyResult(await s.syncCourse(m));
+          // and, for a manual pull, nothing this device wrote has gone missing.
+          if (!(await s.needsSync(m, { restoreMissing }))) continue;
+          notifyResult(await s.syncCourse(m, undefined, { restoreMissing }));
         } catch (e) {
           failed.push(courseId);
           console.error(`obsync: course ${courseId} failed`, e);

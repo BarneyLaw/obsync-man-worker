@@ -65,7 +65,7 @@ describe("preview of the manifest the worker writes", () => {
     expect(present.action).toBe("have");
 
     const gone = preview(golden, OPEN, written, new Set([e.path])).items.find((i) => i.entry.path === e.path)!;
-    expect(gone.action).toBe("download");
+    expect(gone.action).toBe("restore");
     expect(gone.reason).toMatch(/missing from the vault/);
   });
 

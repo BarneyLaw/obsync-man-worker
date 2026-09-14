@@ -316,7 +316,7 @@ describe("course folders", () => {
 
     const res = await make(state).syncCourse(m);
 
-    expect(res.added + res.updated + res.adopted).toBe(0);
+    expect(res.added + res.updated + res.restored + res.adopted).toBe(0);
     expect(adapter.read(`${C}/a.pdf`)).toBe("aaa");
     expect(await adapter.exists("Canvas/TST1001 (42)")).toBe(false);
     expect(store.gets).toEqual([]);
@@ -374,7 +374,7 @@ describe("upgrading from one shared folder (state version 1)", () => {
     expect(await s.needsSync(m)).toBe(true);
     const res = await s.syncCourse(m);
 
-    expect(res.added).toBe(1);
+    expect(res.restored).toBe(1);
     expect(adapter.read(`${C}/a.pdf`)).toBe("aaa");
   });
 
@@ -504,9 +504,10 @@ describe("partial vs full pulls", () => {
 });
 
 describe("files deleted from the vault", () => {
-  // The reported bug: pull, delete the files, and the panel says everything is
-  // up to date forever, because the record said so and the run had not changed.
-  it("are found missing, offered again, and re-pulled without a new run", async () => {
+  // The first reported bug: pull, delete the files, and the panel says
+  // everything is up to date forever, because the record said so and the run
+  // had not changed.
+  it("are found missing, offered again, and restored by a manual pull", async () => {
     const { adapter, make } = build(["aaa", "bbb"]);
     const m = manifest([entry("a.pdf", "aaa"), entry("Week 1/b.pdf", "bbb")]);
     const s = make();
@@ -520,15 +521,49 @@ describe("files deleted from the vault", () => {
     expect([...missing].sort()).toEqual(["Week 1/b.pdf", "a.pdf"]);
     expect(await s.needsSync(m)).toBe(true);
     const actions = s.previewCourse(m, missing).items.map((i) => i.action);
-    expect(actions).toEqual(["download", "download"]);
+    expect(actions).toEqual(["restore", "restore"]);
 
     const res = await s.syncCourse(m);
 
-    expect(res.added).toBe(2);
+    expect(res.restored).toBe(2);
     expect(res.conflicts).toEqual([]);
     expect(adapter.read(`${C}/a.pdf`)).toBe("aaa");
     expect(adapter.read(`${C}/Week 1/b.pdf`)).toBe("bbb");
     expect(await s.needsSync(m)).toBe(false);
+  });
+
+  // The second reported bug: after deleting a pull, every reopen of Obsidian
+  // pulled it all back, because the startup pull restored missing files.
+  it("are left alone by automatic pulls", async () => {
+    const { adapter, store, make } = build(["aaa"]);
+    const m = manifest([entry("a.pdf", "aaa")]);
+    const s = make();
+    await s.syncCourse(m);
+    adapter.files.delete(`${C}/a.pdf`);
+    store.gets.length = 0;
+
+    expect(await s.needsSync(m, { restoreMissing: false })).toBe(false);
+    const res = await s.syncCourse(m, undefined, { restoreMissing: false });
+
+    expect(res.restored).toBe(0);
+    expect(res.skipped).toBe(1);
+    expect(adapter.files.has(`${C}/a.pdf`)).toBe(false);
+    expect(store.gets).toEqual([]);
+  });
+
+  it("stay deleted when an automatic pull fetches a new run", async () => {
+    const { adapter, make } = build(["aaa", "new"]);
+    const s = make();
+    await s.syncCourse(manifest([entry("a.pdf", "aaa")], "run-1"));
+    adapter.files.delete(`${C}/a.pdf`);
+
+    const next = manifest([entry("a.pdf", "aaa"), entry("new.pdf", "new")], "run-2");
+    expect(await s.needsSync(next, { restoreMissing: false })).toBe(true);
+    const res = await s.syncCourse(next, undefined, { restoreMissing: false });
+
+    expect(res.added).toBe(1);
+    expect(adapter.read(`${C}/new.pdf`)).toBe("new");
+    expect(adapter.files.has(`${C}/a.pdf`)).toBe(false);
   });
 
   it("only counts files this device recorded writing", async () => {

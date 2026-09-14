@@ -11,6 +11,8 @@ import { courseFolderName } from "./folders";
 export interface SyncResult {
   added: number;
   updated: number;
+  /** Files put back after being deleted from the vault. */
+  restored: number;
   removed: number;
   conflicts: string[];
   skipped: number;
@@ -21,6 +23,16 @@ export interface SyncResult {
 
 /** Outcome of a single entry write. */
 type WriteOutcome = "written" | "conflict" | "adopted";
+
+export interface SyncOptions {
+  /**
+   * Put back files this device wrote that have since been deleted from the
+   * vault. True (the default) for pulls the user starts. False for the
+   * automatic pull on startup and on the interval: deleting a mirrored file
+   * must not be silently undone the next time Obsidian opens.
+   */
+  restoreMissing?: boolean;
+}
 
 export interface SyncFolders {
   targetFolder: string;
@@ -139,13 +151,14 @@ export class Syncer {
   }
 
   /**
-   * Whether a background pull has work: the worker published a run this device
-   * has not finished, or files this device wrote have gone missing.
+   * Whether a pull has work: the worker published a run this device has not
+   * finished, or (only when restoring) files this device wrote have gone
+   * missing from the vault.
    */
-  async needsSync(m: Manifest): Promise<boolean> {
+  async needsSync(m: Manifest, opts: SyncOptions = {}): Promise<boolean> {
     await this.migrateCourse(m);
     if (this.state.lastRunId[String(m.course_id)] !== m.run_id) return true;
-    return (await this.missingFiles(m)).size > 0;
+    return (opts.restoreMissing ?? true) && (await this.missingFiles(m)).size > 0;
   }
 
   previewCourse(m: Manifest, missing: ReadonlySet<string> = new Set()): Preview {
@@ -158,10 +171,11 @@ export class Syncer {
    *   tombstones: the run is not finished, and claiming otherwise would make
    *   pullAll skip the course and strand every unselected file.
    */
-  async syncCourse(m: Manifest, only?: Set<string>): Promise<SyncResult> {
+  async syncCourse(m: Manifest, only?: Set<string>, opts: SyncOptions = {}): Promise<SyncResult> {
     const res: SyncResult = {
-      added: 0, updated: 0, removed: 0, conflicts: [], skipped: 0, errors: [], adopted: 0,
+      added: 0, updated: 0, restored: 0, removed: 0, conflicts: [], skipped: 0, errors: [], adopted: 0,
     };
+    const restore = opts.restoreMissing ?? true;
     await this.migrateCourse(m);
     const p = this.previewCourse(m, await this.missingFiles(m));
     const files = this.course(m).files;
@@ -169,13 +183,19 @@ export class Syncer {
 
     for (const item of p.items) {
       if (only && !only.has(item.entry.path)) continue;
+      if (item.action === "restore" && !restore) {
+        res.skipped++;
+        continue;
+      }
       try {
         switch (item.action) {
           case "download":
-          case "update": {
+          case "update":
+          case "restore": {
             const outcome = await this.writeEntry(m, item.entry);
             if (outcome === "conflict") res.conflicts.push(item.entry.path);
             else if (outcome === "adopted") res.adopted++;
+            else if (item.action === "restore") res.restored++;
             else if (item.action === "download") res.added++;
             else res.updated++;
             break;
@@ -415,6 +435,7 @@ export function uniquify(path: string, n: number): string {
 
 export function notifyResult(r: SyncResult) {
   const parts = [`${r.added} new`, `${r.updated} updated`, `${r.removed} removed`];
+  if (r.restored) parts.push(`${r.restored} restored`);
   if (r.adopted) parts.push(`${r.adopted} already present`);
   if (r.conflicts.length) parts.push(`${r.conflicts.length} conflicts`);
   if (r.errors.length) parts.push(`${r.errors.length} errors`);

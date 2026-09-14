@@ -20,7 +20,7 @@ const AUTO_EXPAND_FILES = 12;
 /** What the plugin has to expose for the panel to drive it. */
 export type ObsyncHost = ObsyncPluginLike & {
   makeSyncer(): Syncer | null;
-  pullAll(): Promise<void>;
+  pullAll(opts?: { manual?: boolean }): Promise<void>;
   onStatus(cb: (text: string) => void): () => void;
   currentStatus(): string;
 };
@@ -121,7 +121,7 @@ export class ObsyncView extends ItemView {
     const pull = bar.createEl("button", { text: "Pull now", cls: "mod-cta" });
     pull.addEventListener("click", () => {
       void (async () => {
-        await this.plugin.pullAll();
+        await this.plugin.pullAll({ manual: true });
         await this.refresh();
       })();
     });
@@ -187,7 +187,7 @@ export class ObsyncView extends ItemView {
 
   private renderWithheld(parent: HTMLElement, p: Preview) {
     const withheld = p.items.filter(
-      (i) => i.action !== "download" && i.action !== "update" && i.action !== "have",
+      (i) => i.action !== "download" && i.action !== "update" && i.action !== "restore" && i.action !== "have",
     );
     if (withheld.length === 0) return;
 
@@ -383,7 +383,7 @@ export class ObsyncView extends ItemView {
 }
 
 const pullable = (p: Preview): PreviewItem[] =>
-  p.items.filter((i) => i.action === "download" || i.action === "update");
+  p.items.filter((i) => i.action === "download" || i.action === "update" || i.action === "restore");
 
 function overflow(parent: HTMLElement, total: number) {
   if (total > MAX_ROWS) {
