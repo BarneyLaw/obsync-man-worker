@@ -109,6 +109,10 @@ links → Excluded files** if search gets noisy.
 On load (after a delay), on an interval, and manually from the panel. **Never on vault file
 change** — a mirror that reacts to your own edits is a feedback loop.
 
+A mirrored file you delete from the vault is pulled again on the next sync. The
+panel lists it as "missing from the vault". To keep a file out for good, exclude
+it with a local rule instead of deleting it.
+
 ## Development
 
 ```sh

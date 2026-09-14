@@ -323,6 +323,48 @@ describe("partial vs full pulls", () => {
   });
 });
 
+describe("files deleted from the vault", () => {
+  // The reported bug: pull, delete the files, and the panel says everything is
+  // up to date forever, because the record said so and the run had not changed.
+  it("are found missing, offered again, and re-pulled without a new run", async () => {
+    const { adapter, make } = build(["aaa", "bbb"]);
+    const m = manifest([entry("a.pdf", "aaa"), entry("Week 1/b.pdf", "bbb")]);
+    const s = make();
+    await s.syncCourse(m);
+    expect(await s.needsSync(m)).toBe(false);
+
+    adapter.files.delete("Canvas/a.pdf");
+    adapter.files.delete("Canvas/Week 1/b.pdf");
+
+    const missing = await s.missingFiles(m);
+    expect([...missing].sort()).toEqual(["Week 1/b.pdf", "a.pdf"]);
+    expect(await s.needsSync(m)).toBe(true);
+    const actions = s.previewCourse(m, missing).items.map((i) => i.action);
+    expect(actions).toEqual(["download", "download"]);
+
+    const res = await s.syncCourse(m);
+
+    expect(res.added).toBe(2);
+    expect(res.conflicts).toEqual([]);
+    expect(adapter.read("Canvas/a.pdf")).toBe("aaa");
+    expect(adapter.read("Canvas/Week 1/b.pdf")).toBe("bbb");
+    expect(await s.needsSync(m)).toBe(false);
+  });
+
+  it("only counts files this device recorded writing", async () => {
+    const { make } = build(["aaa"]);
+    const m = manifest([entry("a.pdf", "aaa")]);
+    expect((await make().missingFiles(m)).size).toBe(0);
+  });
+
+  it("ignores files the manifest no longer stores", async () => {
+    const { state, make } = build([]);
+    state.files["gone.pdf"] = { sha256: hashOf("x"), size: 1, writtenAt: 0 };
+    const m = manifest([entry("gone.pdf", "x", { state: "deleted" })]);
+    expect((await make(state).missingFiles(m)).size).toBe(0);
+  });
+});
+
 describe("tombstones", () => {
   it("moves a removed file to trash rather than deleting it", async () => {
     const { adapter, state, make } = build([]);

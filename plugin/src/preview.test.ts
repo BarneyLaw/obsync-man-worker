@@ -57,6 +57,19 @@ describe("preview of the manifest the worker writes", () => {
     expect(item.reason).toContain(e.reason);
   });
 
+  it("offers a recorded file again once it is missing from the vault", () => {
+    const e = golden.entries.find((x) => x.state === "stored" && !x.reason)!;
+    const state = emptyState();
+    state.files[e.path] = { sha256: e.sha256!, size: e.size, writtenAt: 0 };
+
+    const present = preview(golden, OPEN, state).items.find((i) => i.entry.path === e.path)!;
+    expect(present.action).toBe("have");
+
+    const gone = preview(golden, OPEN, state, new Set([e.path])).items.find((i) => i.entry.path === e.path)!;
+    expect(gone.action).toBe("download");
+    expect(gone.reason).toMatch(/missing from the vault/);
+  });
+
   it("applies local rules with the manifest's course id", () => {
     const local: Policy = {
       version: 1, default: "include",

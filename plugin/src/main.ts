@@ -98,8 +98,9 @@ export default class ObsyncPlugin extends Plugin {
         try {
           const m = await s.fetchManifest(courseId);
           if (!m) continue;
-          // Skip work when the worker has not published since we last looked.
-          if (this.state.lastRunId[String(courseId)] === m.run_id) continue;
+          // Skip work when the worker has not published since we last looked
+          // and nothing this device wrote has gone missing from the vault.
+          if (!(await s.needsSync(m))) continue;
           notifyResult(await s.syncCourse(m));
         } catch (e) {
           failed.push(courseId);

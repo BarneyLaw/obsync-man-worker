@@ -1,7 +1,7 @@
 import { Plugin, Notice, normalizePath } from "obsidian";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
-import { Manifest, Entry, blobKey, latestKey, manifestKey, parseManifest } from "./types";
+import { Manifest, Entry, blobKey, latestKey, manifestKey, parseManifest, liveEntries } from "./types";
 import { Policy } from "./policy";
 import { FileRecord, LocalState, saveState } from "./state";
 import { RemoteStore, chunkSize, CHUNK_THRESHOLD } from "./store";
@@ -60,8 +60,32 @@ export class Syncer {
     return m;
   }
 
-  previewCourse(m: Manifest): Preview {
-    return preview(m, this.policy, this.state);
+  /**
+   * Stored entries this device recorded as written whose file is no longer in
+   * the vault.
+   *
+   * The record alone is what makes preview call a file up to date. Without this
+   * check, a file the user deleted stays "up to date" forever and is never
+   * pulled again, and pullAll skips the course because the run has not changed.
+   */
+  async missingFiles(m: Manifest): Promise<Set<string>> {
+    const adapter = this.plugin.app.vault.adapter;
+    const recorded = liveEntries(m).filter((e) => e.state === "stored" && this.state.files[e.path]);
+    const present = await Promise.all(recorded.map((e) => adapter.exists(this.dest(e.path))));
+    return new Set(recorded.filter((_, i) => !present[i]).map((e) => e.path));
+  }
+
+  /**
+   * Whether a background pull has work: the worker published a run this device
+   * has not finished, or files this device wrote have gone missing.
+   */
+  async needsSync(m: Manifest): Promise<boolean> {
+    if (this.state.lastRunId[String(m.course_id)] !== m.run_id) return true;
+    return (await this.missingFiles(m)).size > 0;
+  }
+
+  previewCourse(m: Manifest, missing: ReadonlySet<string> = new Set()): Preview {
+    return preview(m, this.policy, this.state, missing);
   }
 
   /**
@@ -74,7 +98,7 @@ export class Syncer {
     const res: SyncResult = {
       added: 0, updated: 0, removed: 0, conflicts: [], skipped: 0, errors: [], adopted: 0,
     };
-    const p = this.previewCourse(m);
+    const p = this.previewCourse(m, await this.missingFiles(m));
     const partial = only !== undefined;
 
     for (const item of p.items) {
@@ -121,7 +145,7 @@ export class Syncer {
   private async writeEntry(e: Entry): Promise<WriteOutcome> {
     if (!e.sha256) throw new Error("stored entry without a hash");
     const adapter = this.plugin.app.vault.adapter;
-    const dest = normalizePath(`${this.settings.targetFolder}/${e.path}`);
+    const dest = this.dest(e.path);
     const known = this.state.files[e.path];
 
     // One-way sync is NOT a licence to destroy local data.
@@ -238,6 +262,11 @@ export class Syncer {
     await this.ensureDir(dst);
     await adapter.rename(src, dst);
     delete this.state.files[path];
+  }
+
+  /** Vault path of a manifest entry. */
+  private dest(path: string): string {
+    return normalizePath(`${this.settings.targetFolder}/${path}`);
   }
 
   /** `.obsidian/plugins/<id>/.parts`, with a fallback: manifest.dir is optional. */

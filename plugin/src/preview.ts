@@ -34,14 +34,24 @@ export interface Preview {
   locked: number;
 }
 
-export function preview(m: Manifest, p: Policy, state: LocalState): Preview {
+/**
+ * @param missing - paths this device recorded as written that are no longer in
+ *   the vault (Syncer.missingFiles). The only non-pure input, passed in so this
+ *   stays a function of its arguments.
+ */
+export function preview(
+  m: Manifest,
+  p: Policy,
+  state: LocalState,
+  missing: ReadonlySet<string> = new Set(),
+): Preview {
   const out: Preview = {
     items: [], toDownload: 0, bytesToDownload: 0,
     alreadyHave: 0, skippedLocal: 0, skippedWorker: 0, deferred: 0, locked: 0,
   };
 
   for (const e of liveEntries(m)) {
-    const item = classify(e, m.course_id, p, state);
+    const item = classify(e, m.course_id, p, state, missing);
     out.items.push(item);
     switch (item.action) {
       case "download":
@@ -59,7 +69,13 @@ export function preview(m: Manifest, p: Policy, state: LocalState): Preview {
   return out;
 }
 
-function classify(e: Entry, courseId: number, p: Policy, state: LocalState): PreviewItem {
+function classify(
+  e: Entry,
+  courseId: number,
+  p: Policy,
+  state: LocalState,
+  missing: ReadonlySet<string>,
+): PreviewItem {
   if (e.state === "locked") {
     const when = e.unlock_at ? new Date(e.unlock_at).toLocaleString() : "unknown";
     return { entry: e, action: "locked", reason: `unlocks ${when}` };
@@ -89,6 +105,12 @@ function classify(e: Entry, courseId: number, p: Policy, state: LocalState): Pre
   // refresh that means an older version is being served.
   const note = e.reason ? ` (${e.reason})` : "";
   const known = state.files[e.path];
+  if (known && missing.has(e.path)) {
+    // Recorded as written, but gone from the vault: deleted by the user, or a
+    // restored vault without it. A mirror puts it back. Keeping a file out for
+    // good is what local rules are for.
+    return { entry: e, action: "download", reason: `missing from the vault, ${humanBytes(e.size)}${note}` };
+  }
   if (known && known.sha256 === e.sha256) {
     return { entry: e, action: "have", reason: `up to date${note}` };
   }
