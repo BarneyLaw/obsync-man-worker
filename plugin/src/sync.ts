@@ -32,7 +32,7 @@ export interface SyncFolders {
  * Consumer sync loop.
  *
  * Each course lives in its own folder under the target folder (courseFolderName,
- * "CS3103 (93794)"), and so do its trash and conflicts. Records are kept per
+ * "CS3103 [2610] (93794)"), and so do its trash and conflicts. Records are kept per
  * course, so two courses that both have "Labs/lab1.pdf" hold two files, never
  * one.
  *

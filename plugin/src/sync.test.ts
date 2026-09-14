@@ -17,7 +17,7 @@ const FOLDERS = {
 };
 
 /** The test course's folder, as courseFolderName names it. */
-const C = "Canvas/TST1001 (42)";
+const C = "Canvas/TST1001 [2610] (42)";
 
 const enc = (s: string) => new TextEncoder().encode(s);
 const hashOf = (s: string) => bytesToHex(sha256(enc(s)));
@@ -291,7 +291,7 @@ describe("course folders", () => {
     expect(b.added).toBe(1);
     expect(b.conflicts).toEqual([]);
     expect(adapter.read(`${C}/Labs/lab1.pdf`)).toBe("course 42");
-    expect(adapter.read("Canvas/TST2002 (43)/Labs/lab1.pdf")).toBe("course 43");
+    expect(adapter.read("Canvas/TST2002 [2610] (43)/Labs/lab1.pdf")).toBe("course 43");
     expect(Object.keys(state.courses).sort()).toEqual(["42", "43"]);
   });
 
@@ -303,6 +303,23 @@ describe("course folders", () => {
     await make().syncCourse(m);
 
     expect(adapter.read("Canvas/42/a.pdf")).toBe("aaa");
+  });
+
+  it("moves the folder when its name changes, e.g. from the earlier code (id) format", async () => {
+    const { adapter, store, state, make } = build(["aaa"]);
+    adapter.write("Canvas/TST1001 (42)/a.pdf", "aaa", 1000);
+    state.courses["42"] = {
+      folder: "TST1001 (42)",
+      files: { "a.pdf": { sha256: hashOf("aaa"), size: 3, writtenAt: 1000 } },
+    };
+    const m = manifest([entry("a.pdf", "aaa")]);
+
+    const res = await make(state).syncCourse(m);
+
+    expect(res.added + res.updated + res.adopted).toBe(0);
+    expect(adapter.read(`${C}/a.pdf`)).toBe("aaa");
+    expect(await adapter.exists("Canvas/TST1001 (42)")).toBe(false);
+    expect(store.gets).toEqual([]);
   });
 
   it("moves the folder, without downloading, when the course gains its code", async () => {
@@ -319,7 +336,7 @@ describe("course folders", () => {
 
     expect(adapter.read(`${C}/Week 1/a.pdf`)).toBe("aaa");
     expect(adapter.files.has("Canvas/42/Week 1/a.pdf")).toBe(false);
-    expect(state.courses["42"]?.folder).toBe("TST1001 (42)");
+    expect(state.courses["42"]?.folder).toBe("TST1001 [2610] (42)");
     expect(store.gets).toEqual([]);
   });
 });
@@ -396,7 +413,7 @@ describe("writeEntry: not destroying local data", () => {
     const res = await make().syncCourse(manifest([entry("a.pdf", "new content")]));
 
     expect(res.conflicts).toEqual(["a.pdf"]);
-    expect(adapter.read("Canvas/_conflicts/TST1001 (42)/a.pdf")).toBe("the user's own work");
+    expect(adapter.read("Canvas/_conflicts/TST1001 [2610] (42)/a.pdf")).toBe("the user's own work");
     // The user's bytes survived; nothing was overwritten in place.
     expect(adapter.files.has(`${C}/a.pdf`)).toBe(false);
     expect(files(state)["a.pdf"]).toBeUndefined();
@@ -410,7 +427,7 @@ describe("writeEntry: not destroying local data", () => {
     const res = await make(state).syncCourse(manifest([entry("a.pdf", "v2")]));
 
     expect(res.conflicts).toEqual(["a.pdf"]);
-    expect(adapter.read("Canvas/_conflicts/TST1001 (42)/a.pdf")).toBe("edited by hand");
+    expect(adapter.read("Canvas/_conflicts/TST1001 [2610] (42)/a.pdf")).toBe("edited by hand");
   });
 
   it("adopts a file already containing the right bytes instead of re-downloading", async () => {
@@ -441,13 +458,13 @@ describe("writeEntry: not destroying local data", () => {
   it("does not collide when a second conflict arrives for the same path", async () => {
     const { adapter, make } = build(["v3"]);
     adapter.write(`${C}/a.pdf`, "mine");
-    adapter.write("Canvas/_conflicts/TST1001 (42)/a.pdf", "an earlier conflict");
+    adapter.write("Canvas/_conflicts/TST1001 [2610] (42)/a.pdf", "an earlier conflict");
 
     const res = await make().syncCourse(manifest([entry("a.pdf", "v3")]));
 
     expect(res.conflicts).toEqual(["a.pdf"]);
-    expect(adapter.read("Canvas/_conflicts/TST1001 (42)/a.pdf")).toBe("an earlier conflict");
-    const extra = [...adapter.files.keys()].filter((k) => /_conflicts\/TST1001 \(42\)\/a \(\d+\)\.pdf/.test(k));
+    expect(adapter.read("Canvas/_conflicts/TST1001 [2610] (42)/a.pdf")).toBe("an earlier conflict");
+    const extra = [...adapter.files.keys()].filter((k) => /_conflicts\/TST1001 \[2610\] \(42\)\/a \(\d+\)\.pdf/.test(k));
     expect(extra).toHaveLength(1);
   });
 });
@@ -539,7 +556,7 @@ describe("tombstones", () => {
     );
 
     expect(res.removed).toBe(1);
-    expect(adapter.read("Canvas/_trash/TST1001 (42)/gone.pdf")).toBe("lecture");
+    expect(adapter.read("Canvas/_trash/TST1001 [2610] (42)/gone.pdf")).toBe("lecture");
     expect(adapter.files.has(`${C}/gone.pdf`)).toBe(false);
     expect(files(state)["gone.pdf"]).toBeUndefined();
   });

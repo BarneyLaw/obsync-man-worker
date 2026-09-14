@@ -100,19 +100,25 @@ nothing to change on your side.
 
 ## Folders
 
-Each course gets its own folder under the target folder, named by course code
-and Canvas id, and so do its trash and conflicts:
+Each course gets its own folder under the target folder, named
+`code [term] (id)`, and so do its trash and conflicts:
 
 ```
 Canvas/
-  CS3103 (93794)/Labs/labs-intro.pdf
-  CS2103-CS2103T (77826)/...          "/" in a cross-listed code becomes "-"
-  _trash/CS3103 (93794)/...
-  _conflicts/CS3103 (93794)/...
+  CS3103 [2610] (93794)/Labs/labs-intro.pdf
+  CS2103-CS2103T [2510] (77826)/...   "/" in a cross-listed code becomes "-"
+  CP2106 (81917)/...                  no term tag in the Canvas name
+  _trash/CS3103 [2610] (93794)/...
+  _conflicts/CS3103 [2610] (93794)/...
 ```
 
-The id keeps two courses apart even when both have a `Labs/lab1.pdf`, or when
-the same module runs again in a later term. Files pulled by an earlier version
+The term is the tag the Canvas course name ends with. The id keeps two courses
+apart even when both have a `Labs/lab1.pdf`. If the name format changes, the
+folder is renamed on the next sync, not downloaded again.
+
+Obsidian's `[[wikilinks]]` cannot contain `[` or `]`, so link to these files
+with Markdown links (`[slides](<Canvas/CS3103 [2610] (93794)/Labs/x.pdf>)`)
+or embeds made through Obsidian's own link picker. Files pulled by an earlier version
 of the plugin, when every course shared one folder, are moved into their
 course's folder by the next sync: renamed, not downloaded again. A manifest
 from a worker too old to send the course code gives a folder named by id
