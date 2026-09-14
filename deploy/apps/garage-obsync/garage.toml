@@ -18,6 +18,20 @@ replication_factor = 3
 
 rpc_bind_addr = "[::]:3901"
 
+# How the three nodes find each other. Nothing discovers peers in this setup:
+# a fresh node knows only itself, and `garage status` on garage-0 lists one
+# node until the others are connected. Node IDs are generated on first start
+# and kept in the meta volume, so this list is filled in once, after the layout
+# exists (README step 5), and committed. Peers are named by the headless
+# Service's DNS names, resolved again on every start, so a pod that returns on a
+# new IP rejoins with no manual step.
+#
+# bootstrap_peers = [
+#   "<garage-0 node id>@garage-0.garage-rpc.obsync.svc.cluster.local:3901",
+#   "<garage-1 node id>@garage-1.garage-rpc.obsync.svc.cluster.local:3901",
+#   "<garage-2 node id>@garage-2.garage-rpc.obsync.svc.cluster.local:3901",
+# ]
+
 [s3_api]
 s3_region     = "garage"
 api_bind_addr = "[::]:3900"

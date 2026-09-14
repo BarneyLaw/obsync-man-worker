@@ -4,8 +4,8 @@ A 3-node Garage cluster in the `obsync` namespace, serving as the S3 store for
 obsync phase 1. Independent of the Garage on nebula that backs CNPG/etcd
 backups — separate cluster, separate RPC secret, separate failure domain.
 
-The manifests get you running pods. Three things are **not** in git and must be
-done by hand, in order.
+The manifests get you running pods. Forming the cluster takes the steps below,
+in order; only steps 1 and 5 end in a commit.
 
 ---
 
@@ -42,33 +42,65 @@ kubectl -n obsync get pods -w
 Expect three pods `Running` but `0/1 Ready`. That is correct at this point:
 readiness is `/health`, and `/health` is 503 until a layout exists.
 
-## 3. Assign the cluster layout (one time, per node)
+## 3. Connect the nodes (one time)
+
+Nothing discovers peers here: each pod starts knowing only itself, and
+`garage status` on garage-0 lists a single node. Connect them by hand so the
+layout can be assigned. Step 5 makes the connection permanent.
+
+```bash
+for i in 0 1 2; do
+  echo "garage-$i $(kubectl -n obsync exec garage-$i -- /garage node id -q)"
+done
+
+kubectl -n obsync exec garage-0 -- /garage node connect \
+  <id-1>@garage-1.garage-rpc.obsync.svc.cluster.local:3901
+kubectl -n obsync exec garage-0 -- /garage node connect \
+  <id-2>@garage-2.garage-rpc.obsync.svc.cluster.local:3901
+
+kubectl -n obsync exec garage-0 -- /garage status   # HEALTHY NODES lists all three
+```
+
+Keep the three IDs for step 5.
+
+## 4. Assign the cluster layout (one time, per node)
 
 Garage's layout is cluster metadata, not Kubernetes state. ArgoCD has no
 visibility into it and cannot recreate it.
 
 ```bash
-kubectl -n obsync exec garage-0 -- /garage status     # collect the 3 node IDs
+kubectl -n obsync get pods -o wide   # which node each garage-N landed on
 
-# One zone per node — Garage prefers to place the 3 replicas in distinct zones.
-# Capacity should be the real free space on that node's disk, not the PVC size:
-# local-path does not enforce the 100Gi request.
-kubectl -n obsync exec garage-0 -- /garage layout assign -z nebula -c 90G <id-0>
-kubectl -n obsync exec garage-0 -- /garage layout assign -z opus   -c 90G <id-1>
-kubectl -n obsync exec garage-0 -- /garage layout assign -z sol    -c 90G <id-2>
+# One zone per node, named after the node the pod runs on: Garage places the 3
+# replicas in distinct zones. Capacity should be the real free space on that
+# node's disk, not the PVC size: local-path does not enforce the 100Gi request.
+kubectl -n obsync exec garage-0 -- /garage layout assign -z <node-of-garage-0> -c 90G <id-0>
+kubectl -n obsync exec garage-0 -- /garage layout assign -z <node-of-garage-1> -c 90G <id-1>
+kubectl -n obsync exec garage-0 -- /garage layout assign -z <node-of-garage-2> -c 90G <id-2>
 
 kubectl -n obsync exec garage-0 -- /garage layout show
 kubectl -n obsync exec garage-0 -- /garage layout apply --version 1
 ```
 
-Within a poll cycle all three pods go `1/1 Ready`.
+Within a poll cycle all three pods go `1/1 Ready`, and `garage status` shows
+each node with its zone and capacity.
+
+## 5. Commit the peers
+
+The connections from step 3 live only in each node's peer cache. That survives
+a restart, but not every pod coming back on a new IP at once, after which no
+node knows where the others are. Uncomment `bootstrap_peers` in `garage.toml`,
+fill in the three IDs, and commit.
 
 ```bash
-kubectl -n obsync exec garage-0 -- /garage status
-# connectedNodes 3, storageNodesOk 3, partitionsAllOk 256
+git add apps/garage-obsync/garage.toml && git commit && git push
 ```
 
-## 4. Bucket and access key for obsync
+The config hash changes, so Argo CD rolls the pods one at a time. This step has
+to come after the layout: a rolling update waits for each pod to be Ready, and
+before step 4 none can be.
+
+## 6. Bucket and access key for obsync
 
 ```bash
 kubectl -n obsync exec garage-0 -- /garage bucket create obsync
@@ -76,8 +108,9 @@ kubectl -n obsync exec garage-0 -- /garage key create obsync-app
 kubectl -n obsync exec garage-0 -- /garage bucket allow --read --write obsync --key obsync-app
 ```
 
-Seal the returned key ID and secret into a separate Secret for the obsync
-backend. Client config:
+The worker's SealedSecret takes this key: see `apps/obsync-worker/README.md`
+step 1. `garage key info obsync-app --show-secret` prints both halves. Client
+config:
 
 | Setting | Value |
 |---|---|

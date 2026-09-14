@@ -56,11 +56,14 @@ spec:
       containers:
         - name: garage
           image: dxflrs/garage:v2.3.0
+          # No GARAGE_RPC_PUBLIC_ADDR. Garage v2.3.0 does not read it: a node
+          # started with only that variable advertises no address at all
+          # (checked against the image locally). It is not needed either. Each
+          # node advertises its current pod IP, and the nodes find each other
+          # through bootstrap_peers in garage.toml, which names them by the
+          # headless Service's stable DNS names. Also checked locally: peers that
+          # come back on new IPs, one at a time or all at once, rejoin unaided.
           env:
-            - name: POD_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.name
             - name: GARAGE_RPC_SECRET
               valueFrom:
                 secretKeyRef:
@@ -71,11 +74,6 @@ spec:
                 secretKeyRef:
                   name: garage-secrets
                   key: admin-token
-            # $(POD_NAME) expands only because POD_NAME is declared earlier in
-            # this same list. Reorder these and the address becomes the literal
-            # string "$(POD_NAME).garage-rpc...".
-            - name: GARAGE_RPC_PUBLIC_ADDR
-              value: "$(POD_NAME).garage-rpc.obsync.svc.cluster.local:3901"
           ports:
             - { containerPort: 3900, name: s3 }
             - { containerPort: 3901, name: rpc }
