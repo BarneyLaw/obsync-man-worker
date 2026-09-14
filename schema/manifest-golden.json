@@ -2,6 +2,7 @@
   "schema_version": 1,
   "course_id": 93794,
   "course_name": "CS3103 Computer Networks Practice",
+  "course_code": "CS3103",
   "run_id": "20260913T150255Z-c3e4",
   "prev_run_id": "20260913T061700Z-0a1b",
   "generated_at": "2026-09-13T15:03:10Z",

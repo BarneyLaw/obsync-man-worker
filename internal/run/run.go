@@ -199,6 +199,7 @@ func (r *Runner) Course(ctx context.Context, c canvas.Course, opt Options) (Stat
 		SchemaVersion: manifest.SchemaVersion,
 		CourseID:      c.ID,
 		CourseName:    c.Name,
+		CourseCode:    c.Code,
 		RunID:         opt.RunID,
 		PrevRunID:     prevRunID,
 		GeneratedAt:   r.Now().UTC(),

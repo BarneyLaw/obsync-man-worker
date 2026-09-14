@@ -151,6 +151,20 @@ func TestCollidingNamesBothDownload(t *testing.T) {
 	}
 }
 
+// The plugin names each course's folder from the code, so it must reach the
+// manifest.
+func TestManifestCarriesCourseCode(t *testing.T) {
+	src := newSource()
+	src.add(1, 2, "a.pdf", "x")
+	st := store.NewMemory()
+	if _, err := runner(src, st, nil).Course(context.Background(), course, Options{RunID: "r1"}); err != nil {
+		t.Fatal(err)
+	}
+	if m := latest(t, st); m.CourseCode != "CS3103" || m.CourseName != course.Name {
+		t.Fatalf("course code %q name %q", m.CourseCode, m.CourseName)
+	}
+}
+
 // Bug 2: unportable names were dropped with only a log line.
 func TestUnportableNameIsStoredUnderStandIn(t *testing.T) {
 	src := newSource()

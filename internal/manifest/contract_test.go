@@ -50,6 +50,7 @@ func goldenManifest() *manifest.Manifest {
 		SchemaVersion: manifest.SchemaVersion,
 		CourseID:      93794,
 		CourseName:    "CS3103 Computer Networks Practice",
+		CourseCode:    "CS3103",
 		RunID:         "20260913T150255Z-c3e4",
 		PrevRunID:     "20260913T061700Z-0a1b",
 		GeneratedAt:   at("2026-09-13T15:03:10Z"),

@@ -53,6 +53,11 @@ describe("manifest written by the Go worker", () => {
     expect(m.entries.length).toBeGreaterThan(0);
   });
 
+  it("carries the course code the plugin names folders with", () => {
+    expect(typeof m.course_code).toBe("string");
+    expect(m.course_code).not.toBe("");
+  });
+
   it("covers every entry state", () => {
     expect(new Set(m.entries.map((e) => e.state))).toEqual(new Set(ENTRY_STATES));
   });
