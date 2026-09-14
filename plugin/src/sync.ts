@@ -3,9 +3,10 @@ import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
 import { Manifest, Entry, blobKey, latestKey, manifestKey, parseManifest, liveEntries } from "./types";
 import { Policy } from "./policy";
-import { FileRecord, LocalState, saveState } from "./state";
+import { CourseRecord, FileRecord, LocalState, saveState } from "./state";
 import { RemoteStore, chunkSize, CHUNK_THRESHOLD } from "./store";
 import { preview, Preview } from "./preview";
+import { courseFolderName } from "./folders";
 
 export interface SyncResult {
   added: number;
@@ -29,6 +30,11 @@ export interface SyncFolders {
 
 /**
  * Consumer sync loop.
+ *
+ * Each course lives in its own folder under the target folder (courseFolderName,
+ * "CS3103 (93794)"), and so do its trash and conflicts. Records are kept per
+ * course, so two courses that both have "Labs/lab1.pdf" hold two files, never
+ * one.
  *
  * Note this diff (manifest entry vs what I wrote locally) is a DIFFERENT
  * algorithm from the worker's diff (Canvas metadata vs previous manifest).
@@ -61,6 +67,62 @@ export class Syncer {
   }
 
   /**
+   * Put this course's files where courseFolderName says they belong. Call
+   * before anything compares the vault with the manifest: an unmoved layout
+   * would read as every file missing and be downloaded again.
+   *
+   * Both moves rename; neither downloads:
+   *  - the course's folder name changed, e.g. a manifest from an older worker
+   *    had no course code, so the folder was named by id alone;
+   *  - files recorded by state version 1, when every course shared the target
+   *    folder, move into the folder of the course whose manifest lists them.
+   */
+  async migrateCourse(m: Manifest): Promise<void> {
+    const adapter = this.plugin.app.vault.adapter;
+    const course = this.course(m);
+    const folder = courseFolderName(m);
+    let changed = false;
+
+    if (course.folder !== folder) {
+      if (course.folder !== undefined) {
+        const from = this.inTarget(course.folder);
+        const to = this.inTarget(folder);
+        // If the new folder already exists, leave the old one alone rather
+        // than merge; anything missing is simply pulled again.
+        if ((await adapter.exists(from)) && !(await adapter.exists(to))) {
+          await this.ensureDir(to);
+          await adapter.rename(from, to);
+        }
+      }
+      course.folder = folder;
+      changed = true;
+    }
+
+    const vacated = new Set<string>();
+    for (const e of liveEntries(m)) {
+      const legacy = this.state.legacyFiles[e.path];
+      if (e.state !== "stored" || !legacy) continue;
+      delete this.state.legacyFiles[e.path];
+      changed = true;
+      if (course.files[e.path]) continue;
+
+      const from = this.inTarget(e.path);
+      const to = this.dest(m, e.path);
+      if ((await adapter.exists(from)) && !(await adapter.exists(to))) {
+        await this.ensureDir(to);
+        await adapter.rename(from, to);
+        vacated.add(parentOf(from));
+      }
+      // Keep the record even when the file is gone: missingFiles then offers it
+      // again, instead of a background pull skipping a run it has already seen.
+      course.files[e.path] = legacy;
+    }
+    await this.pruneEmptyDirs(vacated);
+
+    if (changed) await saveState(this.plugin, this.state, this.settings);
+  }
+
+  /**
    * Stored entries this device recorded as written whose file is no longer in
    * the vault.
    *
@@ -70,8 +132,9 @@ export class Syncer {
    */
   async missingFiles(m: Manifest): Promise<Set<string>> {
     const adapter = this.plugin.app.vault.adapter;
-    const recorded = liveEntries(m).filter((e) => e.state === "stored" && this.state.files[e.path]);
-    const present = await Promise.all(recorded.map((e) => adapter.exists(this.dest(e.path))));
+    const files = this.course(m).files;
+    const recorded = liveEntries(m).filter((e) => e.state === "stored" && files[e.path]);
+    const present = await Promise.all(recorded.map((e) => adapter.exists(this.dest(m, e.path))));
     return new Set(recorded.filter((_, i) => !present[i]).map((e) => e.path));
   }
 
@@ -80,12 +143,13 @@ export class Syncer {
    * has not finished, or files this device wrote have gone missing.
    */
   async needsSync(m: Manifest): Promise<boolean> {
+    await this.migrateCourse(m);
     if (this.state.lastRunId[String(m.course_id)] !== m.run_id) return true;
     return (await this.missingFiles(m)).size > 0;
   }
 
   previewCourse(m: Manifest, missing: ReadonlySet<string> = new Set()): Preview {
-    return preview(m, this.policy, this.state, missing);
+    return preview(m, this.policy, this.course(m).files, missing);
   }
 
   /**
@@ -98,7 +162,9 @@ export class Syncer {
     const res: SyncResult = {
       added: 0, updated: 0, removed: 0, conflicts: [], skipped: 0, errors: [], adopted: 0,
     };
+    await this.migrateCourse(m);
     const p = this.previewCourse(m, await this.missingFiles(m));
+    const files = this.course(m).files;
     const partial = only !== undefined;
 
     for (const item of p.items) {
@@ -107,7 +173,7 @@ export class Syncer {
         switch (item.action) {
           case "download":
           case "update": {
-            const outcome = await this.writeEntry(item.entry);
+            const outcome = await this.writeEntry(m, item.entry);
             if (outcome === "conflict") res.conflicts.push(item.entry.path);
             else if (outcome === "adopted") res.adopted++;
             else if (item.action === "download") res.added++;
@@ -124,9 +190,9 @@ export class Syncer {
 
     if (!partial) {
       for (const e of m.entries) {
-        if (e.state === "deleted" && this.state.files[e.path]) {
+        if (e.state === "deleted" && files[e.path]) {
           try {
-            await this.trash(e.path);
+            await this.trash(m, e.path);
             res.removed++;
           } catch (err) {
             res.errors.push(`${e.path}: ${String(err)}`);
@@ -142,11 +208,12 @@ export class Syncer {
     return res;
   }
 
-  private async writeEntry(e: Entry): Promise<WriteOutcome> {
+  private async writeEntry(m: Manifest, e: Entry): Promise<WriteOutcome> {
     if (!e.sha256) throw new Error("stored entry without a hash");
     const adapter = this.plugin.app.vault.adapter;
-    const dest = this.dest(e.path);
-    const known = this.state.files[e.path];
+    const files = this.course(m).files;
+    const dest = this.dest(m, e.path);
+    const known = files[e.path];
 
     // One-way sync is NOT a licence to destroy local data.
     //
@@ -159,13 +226,13 @@ export class Syncer {
       if (onDisk === e.sha256) {
         // Right bytes already there (second device, or a restored backup).
         // Adopt it instead of re-downloading.
-        this.state.files[e.path] = { sha256: e.sha256, size: e.size, writtenAt: Date.now() };
+        files[e.path] = { sha256: e.sha256, size: e.size, writtenAt: Date.now() };
         return "adopted";
       }
       if (onDisk !== known?.sha256) {
         // Either we have no record of this file, or it no longer matches what
         // we last wrote. Both mean the bytes are not ours to overwrite.
-        await this.quarantine(dest, e.path);
+        await this.quarantine(m, dest, e.path);
         return "conflict";
       }
     }
@@ -216,7 +283,7 @@ export class Syncer {
     await this.ensureDir(dest);
     if (await adapter.exists(dest)) await adapter.remove(dest);
     await adapter.rename(part, dest);
-    this.state.files[e.path] = { sha256: e.sha256, size: e.size, writtenAt: Date.now() };
+    files[e.path] = { sha256: e.sha256, size: e.size, writtenAt: Date.now() };
     return "written";
   }
 
@@ -241,32 +308,62 @@ export class Syncer {
   }
 
   /** Move a locally-modified file aside rather than clobbering it. */
-  private async quarantine(src: string, relPath: string) {
+  private async quarantine(m: Manifest, src: string, relPath: string) {
     const adapter = this.plugin.app.vault.adapter;
-    let q = normalizePath(`${this.settings.conflictFolder}/${relPath}`);
+    let q = normalizePath(`${this.settings.conflictFolder}/${courseFolderName(m)}/${relPath}`);
     if (await adapter.exists(q)) q = uniquify(q, Date.now());
     await this.ensureDir(q);
     await adapter.rename(src, q);
   }
 
   /** Never hard delete. Lecturers unpublish and republish constantly. */
-  private async trash(path: string) {
+  private async trash(m: Manifest, path: string) {
     const adapter = this.plugin.app.vault.adapter;
-    const src = normalizePath(`${this.settings.targetFolder}/${path}`);
+    const files = this.course(m).files;
+    const src = this.dest(m, path);
     if (!(await adapter.exists(src))) {
-      delete this.state.files[path];
+      delete files[path];
       return;
     }
-    let dst = normalizePath(`${this.settings.trashFolder}/${path}`);
+    let dst = normalizePath(`${this.settings.trashFolder}/${courseFolderName(m)}/${path}`);
     if (await adapter.exists(dst)) dst = uniquify(dst, Date.now());
     await this.ensureDir(dst);
     await adapter.rename(src, dst);
-    delete this.state.files[path];
+    delete files[path];
   }
 
-  /** Vault path of a manifest entry. */
-  private dest(path: string): string {
-    return normalizePath(`${this.settings.targetFolder}/${path}`);
+  /** This course's records, created on first use. */
+  private course(m: Manifest): CourseRecord {
+    const id = String(m.course_id);
+    const existing = this.state.courses[id];
+    if (existing) return existing;
+    const created: CourseRecord = { files: {} };
+    this.state.courses[id] = created;
+    return created;
+  }
+
+  /** Vault path of a manifest entry, inside its course's folder. */
+  private dest(m: Manifest, path: string): string {
+    return normalizePath(`${this.settings.targetFolder}/${courseFolderName(m)}/${path}`);
+  }
+
+  private inTarget(rel: string): string {
+    return normalizePath(`${this.settings.targetFolder}/${rel}`);
+  }
+
+  /** Remove directories a migration left empty, up to but not including the target folder. */
+  private async pruneEmptyDirs(dirs: Iterable<string>) {
+    const adapter = this.plugin.app.vault.adapter;
+    const root = normalizePath(this.settings.targetFolder);
+    for (const start of dirs) {
+      let dir = start;
+      while (dir.startsWith(`${root}/`)) {
+        const listed = await adapter.list(dir).catch(() => null);
+        if (!listed || listed.files.length > 0 || listed.folders.length > 0) break;
+        await adapter.rmdir(dir, false);
+        dir = parentOf(dir);
+      }
+    }
   }
 
   /** `.obsidian/plugins/<id>/.parts`, with a fallback: manifest.dir is optional. */
@@ -285,7 +382,7 @@ export class Syncer {
    */
   private async ensureDir(filePath: string) {
     const adapter = this.plugin.app.vault.adapter;
-    const dir = filePath.slice(0, filePath.lastIndexOf("/"));
+    const dir = parentOf(filePath);
     if (!dir) return;
     const parts = dir.split("/").filter((s) => s.length > 0);
     let cur = "";
@@ -301,6 +398,11 @@ export class Syncer {
       }
     }
   }
+}
+
+function parentOf(path: string): string {
+  const i = path.lastIndexOf("/");
+  return i < 0 ? "" : path.slice(0, i);
 }
 
 /** "a/b.pdf" + 123 -> "a/b (123).pdf". Keeps the extension where users expect it. */

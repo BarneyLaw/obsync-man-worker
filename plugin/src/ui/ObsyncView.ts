@@ -83,8 +83,10 @@ export class ObsyncView extends ItemView {
           st.error = "no manifest published for this course yet";
         } else {
           st.manifest = m;
-          // Check the vault, not just the record: a file deleted since it was
-          // pulled must show up as pullable again.
+          // Move files into this course's folder first, then check the vault,
+          // not just the record: a file deleted since it was pulled must show
+          // up as pullable again.
+          await s.migrateCourse(m);
           st.preview = s.previewCourse(m, await s.missingFiles(m));
           for (const i of pullable(st.preview)) st.selected.add(i.entry.path);
         }

@@ -5,7 +5,7 @@ import type { Plugin } from "obsidian";
 import { Syncer, uniquify } from "./sync";
 import { RemoteStore } from "./store";
 import { Manifest, Entry, blobKey, latestKey, manifestKey } from "./types";
-import { LocalState, emptyState } from "./state";
+import { FileRecord, LocalState, emptyState, loadState } from "./state";
 import { Policy } from "./policy";
 
 const OPEN: Policy = { version: 1, default: "include", rules: [] };
@@ -15,6 +15,9 @@ const FOLDERS = {
   trashFolder: "Canvas/_trash",
   conflictFolder: "Canvas/_conflicts",
 };
+
+/** The test course's folder, as courseFolderName names it. */
+const C = "Canvas/TST1001 (42)";
 
 const enc = (s: string) => new TextEncoder().encode(s);
 const hashOf = (s: string) => bytesToHex(sha256(enc(s)));
@@ -34,7 +37,14 @@ class FakeAdapter {
     return new TextDecoder().decode(this.files.get(path));
   }
 
-  exists(p: string) { return Promise.resolve(this.files.has(p) || this.dirs.has(p)); }
+  /** A directory exists if it was made or holds anything, as on a real disk. */
+  private has(p: string) {
+    if (this.files.has(p) || this.dirs.has(p)) return true;
+    const prefix = `${p}/`;
+    return [...this.files.keys(), ...this.dirs].some((k) => k.startsWith(prefix));
+  }
+
+  exists(p: string) { return Promise.resolve(this.has(p)); }
   stat(p: string) {
     const f = this.files.get(p);
     if (!f) return Promise.resolve(null);
@@ -60,32 +70,68 @@ class FakeAdapter {
   }
   remove(p: string) { this.files.delete(p); return Promise.resolve(); }
   rename(from: string, to: string) {
-    const f = this.files.get(from);
-    if (!f) throw new Error(`no such file ${from}`);
     // The real adapter refuses to clobber; make the fake just as strict so a
     // test cannot pass on behaviour Obsidian would reject.
-    if (this.files.has(to)) throw new Error(`rename target exists: ${to}`);
-    this.files.delete(from);
-    this.files.set(to, f);
-    this.mtimes.set(to, Date.now());
+    if (this.has(to)) throw new Error(`rename target exists: ${to}`);
+    const f = this.files.get(from);
+    if (f) {
+      this.files.delete(from);
+      this.files.set(to, f);
+      this.mtimes.set(to, this.mtimes.get(from) ?? Date.now());
+      return Promise.resolve();
+    }
+    if (!this.has(from)) throw new Error(`no such file ${from}`);
+    const prefix = `${from}/`;
+    for (const [k, v] of [...this.files]) {
+      if (k.startsWith(prefix)) {
+        this.files.delete(k);
+        this.files.set(to + k.slice(from.length), v);
+      }
+    }
+    for (const d of [...this.dirs]) {
+      if (d === from || d.startsWith(prefix)) {
+        this.dirs.delete(d);
+        this.dirs.add(to + d.slice(from.length));
+      }
+    }
     return Promise.resolve();
   }
   mkdir(p: string) {
     this.mkdirCalls.push(p);
     // Mirrors a non-recursive mkdir: the parent must already exist.
     const parent = p.slice(0, p.lastIndexOf("/"));
-    if (parent && !this.dirs.has(parent)) throw new Error(`parent missing: ${parent}`);
+    if (parent && !this.has(parent)) throw new Error(`parent missing: ${parent}`);
     this.dirs.add(p);
+    return Promise.resolve();
+  }
+  list(p: string) {
+    const prefix = `${p}/`;
+    const files = new Set<string>();
+    const folders = new Set<string>();
+    for (const k of [...this.files.keys(), ...this.dirs]) {
+      if (!k.startsWith(prefix)) continue;
+      const rest = k.slice(prefix.length);
+      const i = rest.indexOf("/");
+      if (i >= 0) folders.add(prefix + rest.slice(0, i));
+      else if (this.files.has(k)) files.add(k);
+      else folders.add(k);
+    }
+    return Promise.resolve({ files: [...files], folders: [...folders] });
+  }
+  rmdir(p: string) {
+    this.dirs.delete(p);
     return Promise.resolve();
   }
 }
 
 class FakePlugin {
   saved: unknown = null;
+  loaded: unknown = null;
   manifest = { id: "obsync", dir: ".myconfig/plugins/obsync" };
   constructor(public adapter: FakeAdapter) {}
   get app() { return { vault: { adapter: this.adapter, configDir: ".myconfig" } }; }
   saveData(d: unknown) { this.saved = d; return Promise.resolve(); }
+  loadData() { return Promise.resolve(this.loaded); }
 }
 
 /** Serves blob bytes by hash; records what was requested. */
@@ -129,13 +175,18 @@ function manifest(entries: Entry[], runId = "run-2"): Manifest {
   return {
     schema_version: 1,
     course_id: 42,
-    course_name: "Test",
+    course_name: "TST1001 Testing [2610]",
+    course_code: "TST1001",
     run_id: runId,
     generated_at: "2026-01-01T00:00:00Z",
     rules_hash: "abc",
     entries,
   };
 }
+
+/** Test course 42's records. */
+const files = (state: LocalState): Record<string, FileRecord> =>
+  (state.courses["42"] ??= { files: {} }).files;
 
 function build(contents: string[]) {
   const adapter = new FakeAdapter();
@@ -188,14 +239,14 @@ describe("fetchManifest", () => {
 });
 
 describe("writeEntry: downloading", () => {
-  it("writes a new file and records its hash", async () => {
+  it("writes a new file into the course's folder and records its hash", async () => {
     const { adapter, state, make } = build(["hello"]);
     const res = await make().syncCourse(manifest([entry("a.pdf", "hello")]));
 
     expect(res.added).toBe(1);
     expect(res.conflicts).toEqual([]);
-    expect(adapter.read("Canvas/a.pdf")).toBe("hello");
-    expect(state.files["a.pdf"]?.sha256).toBe(hashOf("hello"));
+    expect(adapter.read(`${C}/a.pdf`)).toBe("hello");
+    expect(files(state)["a.pdf"]?.sha256).toBe(hashOf("hello"));
   });
 
   it("creates nested parent directories one level at a time", async () => {
@@ -203,9 +254,10 @@ describe("writeEntry: downloading", () => {
     await make().syncCourse(manifest([entry("Week 1/Lecture 2/s.pdf", "slides")]));
 
     // A single non-recursive mkdir of the full path would have thrown.
-    expect(adapter.read("Canvas/Week 1/Lecture 2/s.pdf")).toBe("slides");
-    expect(adapter.mkdirCalls).toContain("Canvas/Week 1");
-    expect(adapter.mkdirCalls).toContain("Canvas/Week 1/Lecture 2");
+    expect(adapter.read(`${C}/Week 1/Lecture 2/s.pdf`)).toBe("slides");
+    expect(adapter.mkdirCalls).toContain(C);
+    expect(adapter.mkdirCalls).toContain(`${C}/Week 1`);
+    expect(adapter.mkdirCalls).toContain(`${C}/Week 1/Lecture 2`);
   });
 
   it("refuses bytes whose hash does not match the manifest", async () => {
@@ -218,9 +270,120 @@ describe("writeEntry: downloading", () => {
 
     expect(res.added).toBe(0);
     expect(res.errors[0]).toMatch(/hash mismatch/);
-    expect(adapter.files.has("Canvas/a.pdf")).toBe(false);
+    expect(adapter.files.has(`${C}/a.pdf`)).toBe(false);
     // And no part file is left behind.
     expect([...adapter.files.keys()].filter((k) => k.includes(".parts"))).toEqual([]);
+  });
+});
+
+describe("course folders", () => {
+  it("keeps two courses with the same path apart", async () => {
+    const { adapter, state, make } = build(["course 42", "course 43"]);
+    const s = make();
+    const other: Manifest = {
+      ...manifest([entry("Labs/lab1.pdf", "course 43")]), course_id: 43, course_code: "TST2002",
+    };
+
+    const a = await s.syncCourse(manifest([entry("Labs/lab1.pdf", "course 42")]));
+    const b = await s.syncCourse(other);
+
+    expect(a.added).toBe(1);
+    expect(b.added).toBe(1);
+    expect(b.conflicts).toEqual([]);
+    expect(adapter.read(`${C}/Labs/lab1.pdf`)).toBe("course 42");
+    expect(adapter.read("Canvas/TST2002 (43)/Labs/lab1.pdf")).toBe("course 43");
+    expect(Object.keys(state.courses).sort()).toEqual(["42", "43"]);
+  });
+
+  it("names the folder by id alone when the manifest has no course code", async () => {
+    const { adapter, make } = build(["aaa"]);
+    const m = manifest([entry("a.pdf", "aaa")]);
+    delete m.course_code;
+
+    await make().syncCourse(m);
+
+    expect(adapter.read("Canvas/42/a.pdf")).toBe("aaa");
+  });
+
+  it("moves the folder, without downloading, when the course gains its code", async () => {
+    const { adapter, store, state, make } = build(["aaa"]);
+    adapter.write("Canvas/42/Week 1/a.pdf", "aaa", 1000);
+    state.courses["42"] = {
+      folder: "42",
+      files: { "Week 1/a.pdf": { sha256: hashOf("aaa"), size: 3, writtenAt: 1000 } },
+    };
+    const m = manifest([entry("Week 1/a.pdf", "aaa")]);
+    state.lastRunId["42"] = m.run_id;
+
+    expect(await make(state).needsSync(m)).toBe(false);
+
+    expect(adapter.read(`${C}/Week 1/a.pdf`)).toBe("aaa");
+    expect(adapter.files.has("Canvas/42/Week 1/a.pdf")).toBe(false);
+    expect(state.courses["42"]?.folder).toBe("TST1001 (42)");
+    expect(store.gets).toEqual([]);
+  });
+});
+
+describe("upgrading from one shared folder (state version 1)", () => {
+  it("moves recorded files into the course's folder without downloading them", async () => {
+    const { adapter, store, state, make } = build(["aaa", "bbb"]);
+    adapter.write("Canvas/a.pdf", "aaa", 1000);
+    adapter.write("Canvas/Week 1/b.pdf", "bbb", 1000);
+    state.legacyFiles["a.pdf"] = { sha256: hashOf("aaa"), size: 3, writtenAt: 1000 };
+    state.legacyFiles["Week 1/b.pdf"] = { sha256: hashOf("bbb"), size: 3, writtenAt: 1000 };
+    const m = manifest([entry("a.pdf", "aaa"), entry("Week 1/b.pdf", "bbb")]);
+    state.lastRunId["42"] = m.run_id;
+    const s = make(state);
+
+    expect(await s.needsSync(m)).toBe(false);
+
+    expect(adapter.read(`${C}/a.pdf`)).toBe("aaa");
+    expect(adapter.read(`${C}/Week 1/b.pdf`)).toBe("bbb");
+    expect(adapter.files.has("Canvas/a.pdf")).toBe(false);
+    expect(await adapter.exists("Canvas/Week 1")).toBe(false);
+    expect(state.legacyFiles).toEqual({});
+    const actions = s.previewCourse(m, await s.missingFiles(m)).items.map((i) => i.action);
+    expect(actions).toEqual(["have", "have"]);
+    expect(store.gets).toEqual([]);
+  });
+
+  it("still pulls a version 1 file the user had deleted", async () => {
+    const { adapter, state, make } = build(["aaa"]);
+    state.legacyFiles["a.pdf"] = { sha256: hashOf("aaa"), size: 3, writtenAt: 1000 };
+    const m = manifest([entry("a.pdf", "aaa")]);
+    state.lastRunId["42"] = m.run_id;
+    const s = make(state);
+
+    expect(await s.needsSync(m)).toBe(true);
+    const res = await s.syncCourse(m);
+
+    expect(res.added).toBe(1);
+    expect(adapter.read(`${C}/a.pdf`)).toBe("aaa");
+  });
+
+  it("leaves records of paths this course does not list for another course", async () => {
+    const { state, make } = build(["aaa"]);
+    state.legacyFiles["other-course.pdf"] = { sha256: hashOf("x"), size: 1, writtenAt: 0 };
+
+    await make(state).syncCourse(manifest([entry("a.pdf", "aaa")]));
+
+    expect(Object.keys(state.legacyFiles)).toEqual(["other-course.pdf"]);
+  });
+
+  it("loadState upgrades version 1 data, keeping its records for migration", async () => {
+    const plugin = new FakePlugin(new FakeAdapter());
+    const rec = { sha256: "x", size: 1, writtenAt: 0 };
+    plugin.loaded = { state: { version: 1, lastRunId: { "42": "run-1" }, files: { "a.pdf": rec } } };
+
+    const s = await loadState(plugin as unknown as Plugin);
+
+    expect(s).toEqual({ version: 2, lastRunId: { "42": "run-1" }, courses: {}, legacyFiles: { "a.pdf": rec } });
+  });
+
+  it("loadState starts empty on data it does not recognise", async () => {
+    const plugin = new FakePlugin(new FakeAdapter());
+    plugin.loaded = { state: { version: 9 } };
+    expect(await loadState(plugin as unknown as Plugin)).toEqual(emptyState());
   });
 });
 
@@ -228,63 +391,63 @@ describe("writeEntry: not destroying local data", () => {
   it("quarantines a file present on disk that we have NO record of", async () => {
     // The second-device case: the vault synced over, data.json did not.
     const { adapter, state, make } = build(["new content"]);
-    adapter.write("Canvas/a.pdf", "the user's own work");
+    adapter.write(`${C}/a.pdf`, "the user's own work");
 
     const res = await make().syncCourse(manifest([entry("a.pdf", "new content")]));
 
     expect(res.conflicts).toEqual(["a.pdf"]);
-    expect(adapter.read("Canvas/_conflicts/a.pdf")).toBe("the user's own work");
+    expect(adapter.read("Canvas/_conflicts/TST1001 (42)/a.pdf")).toBe("the user's own work");
     // The user's bytes survived; nothing was overwritten in place.
-    expect(adapter.files.has("Canvas/a.pdf")).toBe(false);
-    expect(state.files["a.pdf"]).toBeUndefined();
+    expect(adapter.files.has(`${C}/a.pdf`)).toBe(false);
+    expect(files(state)["a.pdf"]).toBeUndefined();
   });
 
   it("quarantines a file edited since we wrote it", async () => {
     const { adapter, state, make } = build(["v2"]);
-    adapter.write("Canvas/a.pdf", "edited by hand", Date.now());
-    state.files["a.pdf"] = { sha256: hashOf("v1"), size: 2, writtenAt: 0 };
+    adapter.write(`${C}/a.pdf`, "edited by hand", Date.now());
+    files(state)["a.pdf"] = { sha256: hashOf("v1"), size: 2, writtenAt: 0 };
 
     const res = await make(state).syncCourse(manifest([entry("a.pdf", "v2")]));
 
     expect(res.conflicts).toEqual(["a.pdf"]);
-    expect(adapter.read("Canvas/_conflicts/a.pdf")).toBe("edited by hand");
+    expect(adapter.read("Canvas/_conflicts/TST1001 (42)/a.pdf")).toBe("edited by hand");
   });
 
   it("adopts a file already containing the right bytes instead of re-downloading", async () => {
     const { adapter, store, state, make } = build(["same"]);
-    adapter.write("Canvas/a.pdf", "same");
+    adapter.write(`${C}/a.pdf`, "same");
 
     const res = await make().syncCourse(manifest([entry("a.pdf", "same")]));
 
     expect(res.adopted).toBe(1);
     expect(res.conflicts).toEqual([]);
     expect(store.gets).toEqual([]); // no download at all
-    expect(state.files["a.pdf"]?.sha256).toBe(hashOf("same"));
+    expect(files(state)["a.pdf"]?.sha256).toBe(hashOf("same"));
   });
 
   it("overwrites cleanly when the file still matches what we wrote", async () => {
     const { adapter, state, make } = build(["v2"]);
     const written = Date.now();
-    adapter.write("Canvas/a.pdf", "v1", written);
-    state.files["a.pdf"] = { sha256: hashOf("v1"), size: 2, writtenAt: written };
+    adapter.write(`${C}/a.pdf`, "v1", written);
+    files(state)["a.pdf"] = { sha256: hashOf("v1"), size: 2, writtenAt: written };
 
     const res = await make(state).syncCourse(manifest([entry("a.pdf", "v2")]));
 
     expect(res.conflicts).toEqual([]);
     expect(res.updated).toBe(1);
-    expect(adapter.read("Canvas/a.pdf")).toBe("v2");
+    expect(adapter.read(`${C}/a.pdf`)).toBe("v2");
   });
 
   it("does not collide when a second conflict arrives for the same path", async () => {
     const { adapter, make } = build(["v3"]);
-    adapter.write("Canvas/a.pdf", "mine");
-    adapter.write("Canvas/_conflicts/a.pdf", "an earlier conflict");
+    adapter.write(`${C}/a.pdf`, "mine");
+    adapter.write("Canvas/_conflicts/TST1001 (42)/a.pdf", "an earlier conflict");
 
     const res = await make().syncCourse(manifest([entry("a.pdf", "v3")]));
 
     expect(res.conflicts).toEqual(["a.pdf"]);
-    expect(adapter.read("Canvas/_conflicts/a.pdf")).toBe("an earlier conflict");
-    const extra = [...adapter.files.keys()].filter((k) => /_conflicts\/a \(\d+\)\.pdf/.test(k));
+    expect(adapter.read("Canvas/_conflicts/TST1001 (42)/a.pdf")).toBe("an earlier conflict");
+    const extra = [...adapter.files.keys()].filter((k) => /_conflicts\/TST1001 \(42\)\/a \(\d+\)\.pdf/.test(k));
     expect(extra).toHaveLength(1);
   });
 });
@@ -305,21 +468,21 @@ describe("partial vs full pulls", () => {
     const res = await make().syncCourse(two(), new Set(["a.pdf"]));
 
     expect(res.added).toBe(1);
-    expect(adapter.files.has("Canvas/a.pdf")).toBe(true);
-    expect(adapter.files.has("Canvas/b.pdf")).toBe(false);
+    expect(adapter.files.has(`${C}/a.pdf`)).toBe(true);
+    expect(adapter.files.has(`${C}/b.pdf`)).toBe(false);
     expect(state.lastRunId["42"]).toBeUndefined();
   });
 
   it("a partial pull does not act on tombstones", async () => {
     const { adapter, state, make } = build(["aaa"]);
-    adapter.write("Canvas/gone.pdf", "old");
-    state.files["gone.pdf"] = { sha256: hashOf("old"), size: 3, writtenAt: Date.now() };
+    adapter.write(`${C}/gone.pdf`, "old");
+    files(state)["gone.pdf"] = { sha256: hashOf("old"), size: 3, writtenAt: Date.now() };
 
     const m = manifest([entry("a.pdf", "aaa"), entry("gone.pdf", "old", { state: "deleted" })]);
     const res = await make(state).syncCourse(m, new Set(["a.pdf"]));
 
     expect(res.removed).toBe(0);
-    expect(adapter.files.has("Canvas/gone.pdf")).toBe(true);
+    expect(adapter.files.has(`${C}/gone.pdf`)).toBe(true);
   });
 });
 
@@ -333,8 +496,8 @@ describe("files deleted from the vault", () => {
     await s.syncCourse(m);
     expect(await s.needsSync(m)).toBe(false);
 
-    adapter.files.delete("Canvas/a.pdf");
-    adapter.files.delete("Canvas/Week 1/b.pdf");
+    adapter.files.delete(`${C}/a.pdf`);
+    adapter.files.delete(`${C}/Week 1/b.pdf`);
 
     const missing = await s.missingFiles(m);
     expect([...missing].sort()).toEqual(["Week 1/b.pdf", "a.pdf"]);
@@ -346,8 +509,8 @@ describe("files deleted from the vault", () => {
 
     expect(res.added).toBe(2);
     expect(res.conflicts).toEqual([]);
-    expect(adapter.read("Canvas/a.pdf")).toBe("aaa");
-    expect(adapter.read("Canvas/Week 1/b.pdf")).toBe("bbb");
+    expect(adapter.read(`${C}/a.pdf`)).toBe("aaa");
+    expect(adapter.read(`${C}/Week 1/b.pdf`)).toBe("bbb");
     expect(await s.needsSync(m)).toBe(false);
   });
 
@@ -359,38 +522,38 @@ describe("files deleted from the vault", () => {
 
   it("ignores files the manifest no longer stores", async () => {
     const { state, make } = build([]);
-    state.files["gone.pdf"] = { sha256: hashOf("x"), size: 1, writtenAt: 0 };
+    files(state)["gone.pdf"] = { sha256: hashOf("x"), size: 1, writtenAt: 0 };
     const m = manifest([entry("gone.pdf", "x", { state: "deleted" })]);
     expect((await make(state).missingFiles(m)).size).toBe(0);
   });
 });
 
 describe("tombstones", () => {
-  it("moves a removed file to trash rather than deleting it", async () => {
+  it("moves a removed file to the course's trash rather than deleting it", async () => {
     const { adapter, state, make } = build([]);
-    adapter.write("Canvas/gone.pdf", "lecture");
-    state.files["gone.pdf"] = { sha256: hashOf("lecture"), size: 7, writtenAt: Date.now() };
+    adapter.write(`${C}/gone.pdf`, "lecture");
+    files(state)["gone.pdf"] = { sha256: hashOf("lecture"), size: 7, writtenAt: Date.now() };
 
     const res = await make(state).syncCourse(
       manifest([entry("gone.pdf", "lecture", { state: "deleted" })]),
     );
 
     expect(res.removed).toBe(1);
-    expect(adapter.read("Canvas/_trash/gone.pdf")).toBe("lecture");
-    expect(adapter.files.has("Canvas/gone.pdf")).toBe(false);
-    expect(state.files["gone.pdf"]).toBeUndefined();
+    expect(adapter.read("Canvas/_trash/TST1001 (42)/gone.pdf")).toBe("lecture");
+    expect(adapter.files.has(`${C}/gone.pdf`)).toBe(false);
+    expect(files(state)["gone.pdf"]).toBeUndefined();
   });
 
   it("survives a file the user already removed", async () => {
     const { state, make } = build([]);
-    state.files["gone.pdf"] = { sha256: hashOf("x"), size: 1, writtenAt: Date.now() };
+    files(state)["gone.pdf"] = { sha256: hashOf("x"), size: 1, writtenAt: Date.now() };
 
     const res = await make(state).syncCourse(
       manifest([entry("gone.pdf", "x", { state: "deleted" })]),
     );
 
     expect(res.errors).toEqual([]);
-    expect(state.files["gone.pdf"]).toBeUndefined();
+    expect(files(state)["gone.pdf"]).toBeUndefined();
   });
 });
 

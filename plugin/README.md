@@ -98,6 +98,26 @@ rule can never quietly cost you a file without saying so. Files tagged
 (`obsync-worker pull -path ...`) and arrive with its next full pull; there is
 nothing to change on your side.
 
+## Folders
+
+Each course gets its own folder under the target folder, named by course code
+and Canvas id, and so do its trash and conflicts:
+
+```
+Canvas/
+  CS3103 (93794)/Labs/labs-intro.pdf
+  CS2103-CS2103T (77826)/...          "/" in a cross-listed code becomes "-"
+  _trash/CS3103 (93794)/...
+  _conflicts/CS3103 (93794)/...
+```
+
+The id keeps two courses apart even when both have a `Labs/lab1.pdf`, or when
+the same module runs again in a later term. Files pulled by an earlier version
+of the plugin, when every course shared one folder, are moved into their
+course's folder by the next sync: renamed, not downloaded again. A manifest
+from a worker too old to send the course code gives a folder named by id
+alone, and that folder is renamed once a newer worker publishes the code.
+
 ## A warning about search
 
 Dropping hundreds of PDFs into a vault triggers an Obsidian reindex. Keep the
