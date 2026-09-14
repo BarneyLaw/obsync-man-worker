@@ -117,6 +117,49 @@
   width: 100%;
 }
 
+/* File trees: folders first, collapsible, one indent guide per level. */
+.obsync-view .obsync-tree-row {
+  display: flex;
+  align-items: center;
+  gap: var(--size-2-2);
+  padding: var(--size-2-1) 0;
+  min-width: 0;
+}
+
+.obsync-view .obsync-tree-row input[type="checkbox"] {
+  flex: 0 0 auto;
+  margin: 0;
+}
+
+.obsync-view .obsync-tree-caret,
+.obsync-view .obsync-tree-icon {
+  flex: 0 0 auto;
+  display: inline-flex;
+  width: var(--icon-xs);
+  height: var(--icon-xs);
+  color: var(--text-muted);
+}
+
+.obsync-view .obsync-tree-row svg {
+  width: var(--icon-xs);
+  height: var(--icon-xs);
+}
+
+.obsync-view .obsync-tree-caret,
+.obsync-view .obsync-tree-toggle {
+  cursor: pointer;
+}
+
+.obsync-view .obsync-tree-name {
+  font-weight: var(--font-medium);
+}
+
+.obsync-view .obsync-tree-children {
+  margin-left: calc(var(--icon-xs) / 2);
+  padding-left: var(--size-4-2);
+  border-left: 1px solid var(--background-modifier-border);
+}
+
 .obsync-error {
   color: var(--text-error);
 }

@@ -27,8 +27,8 @@ Everything happens in the sidebar panel. Click the cloud icon in the left
 ribbon (or run **Open panel**) and it opens on the right:
 
 - **Status** and the two global actions, Pull now and Refresh.
-- **One section per course**: how much is pending, and a checklist of exactly
-  what will be written. Untick anything you do not want and press Pull
+- **One section per course**: how much is pending, and a folder tree of exactly
+  what will be written. Untick a file, or a whole folder, and press Pull
   selected. Nothing is downloaded until you do.
 - **Not included**, per course: everything Canvas has that was withheld, with
   the reason. A file you can see in Canvas that silently does not appear in

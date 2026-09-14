@@ -1,14 +1,21 @@
-import { ItemView, WorkspaceLeaf, Notice, normalizePath } from "obsidian";
+import { ItemView, WorkspaceLeaf, Notice, normalizePath, setIcon } from "obsidian";
 import { Manifest } from "../types";
 import { Preview, PreviewItem } from "../preview";
 import { humanBytes } from "../policy";
 import { renderSettings, ObsyncPluginLike } from "../settings";
 import { Syncer, notifyResult } from "../sync";
+import { buildTree, filesUnder, TreeFolder } from "../tree";
 
 export const VIEW_TYPE_OBSYNC = "obsync-panel";
 
 /** Long lists get truncated: a semester is ~2000 entries and the DOM notices. */
 const MAX_ROWS = 300;
+
+/**
+ * Below the top level, a folder starts expanded only if it holds at most this
+ * many files, so a big course opens as an overview rather than a wall of rows.
+ */
+const AUTO_EXPAND_FILES = 12;
 
 /** What the plugin has to expose for the panel to drive it. */
 export type ObsyncHost = ObsyncPluginLike & {
@@ -163,21 +170,7 @@ export class ObsyncView extends ItemView {
     if (items.length === 0) {
       details.createEl("p", { cls: "obsync-muted", text: "Everything here is current." });
     } else {
-      const list = details.createDiv({ cls: "obsync-list" });
-      for (const item of items.slice(0, MAX_ROWS)) {
-        const row = list.createDiv({ cls: "obsync-row" });
-        const cb = row.createEl("input", { type: "checkbox" });
-        cb.checked = st.selected.has(item.entry.path);
-        cb.addEventListener("change", () => {
-          if (cb.checked) st.selected.add(item.entry.path);
-          else st.selected.delete(item.entry.path);
-          this.updateCount(id);
-        });
-        const label = row.createDiv({ cls: "obsync-label" });
-        label.createSpan({ cls: "obsync-path", text: item.entry.path });
-        label.createSpan({ cls: "obsync-muted", text: ` ${item.reason}` });
-      }
-      overflow(details, items.length);
+      this.renderTree(details, items, { id, st });
 
       const foot = details.createDiv({ cls: "obsync-actions" });
       const count = foot.createSpan({ cls: "obsync-muted obsync-count" });
@@ -206,15 +199,110 @@ export class ObsyncView extends ItemView {
         "files were left for later by a scoped pull on the worker and arrive with " +
         "its next full pull.",
     });
-    const list = details.createDiv({ cls: "obsync-list" });
-    for (const item of withheld.slice(0, MAX_ROWS)) {
-      const row = list.createDiv({ cls: "obsync-row" });
-      row.createSpan({ cls: "obsync-tag", text: tagFor(item) });
-      const label = row.createDiv({ cls: "obsync-label" });
-      label.createSpan({ cls: "obsync-path", text: item.entry.path });
-      label.createSpan({ cls: "obsync-muted", text: ` ${item.reason}` });
-    }
-    overflow(details, withheld.length);
+    this.renderTree(details, withheld);
+  }
+
+  /**
+   * Items as a collapsible folder tree.
+   *
+   * With `selection`, every file and folder gets a checkbox. A folder's box
+   * selects or clears everything beneath it, and shows a partial state when
+   * only some of it is selected. Without it, each file shows why it is withheld.
+   */
+  private renderTree(
+    parent: HTMLElement,
+    items: PreviewItem[],
+    selection?: { id: number; st: CourseState },
+  ) {
+    const list = parent.createDiv({ cls: "obsync-list obsync-tree" });
+    const folderBoxes: { box: HTMLInputElement; paths: string[] }[] = [];
+
+    const syncFolderBoxes = () => {
+      if (!selection) return;
+      for (const { box, paths } of folderBoxes) {
+        const n = paths.filter((path) => selection.st.selected.has(path)).length;
+        box.checked = n > 0 && n === paths.length;
+        box.indeterminate = n > 0 && n < paths.length;
+      }
+    };
+    const selectionChanged = () => {
+      syncFolderBoxes();
+      if (selection) this.updateCount(selection.id);
+    };
+    const select = (paths: string[], on: boolean) => {
+      if (!selection) return;
+      for (const path of paths) {
+        if (on) selection.st.selected.add(path);
+        else selection.st.selected.delete(path);
+      }
+      selectionChanged();
+    };
+
+    let rendered = 0;
+    const renderFolder = (el: HTMLElement, folder: TreeFolder<PreviewItem>, depth: number) => {
+      for (const sub of folder.folders) {
+        if (rendered >= MAX_ROWS) return;
+        const files = filesUnder(sub);
+        const paths = files.map((f) => f.path);
+        const node = el.createDiv({ cls: "obsync-tree-folder" });
+        const row = node.createDiv({ cls: "obsync-tree-row" });
+        const caret = row.createSpan({ cls: "obsync-tree-caret" });
+
+        if (selection) {
+          const box = row.createEl("input", { type: "checkbox" });
+          folderBoxes.push({ box, paths });
+          box.addEventListener("change", () => select(paths, box.checked));
+        }
+        setIcon(row.createSpan({ cls: "obsync-tree-icon" }), "folder");
+        const label = row.createDiv({ cls: "obsync-label obsync-tree-toggle" });
+        label.createSpan({ cls: "obsync-path obsync-tree-name", text: sub.name });
+        const bytes = files.reduce((n, f) => n + f.value.entry.size, 0);
+        label.createSpan({
+          cls: "obsync-muted",
+          text: ` ${files.length} ${files.length === 1 ? "file" : "files"}, ${humanBytes(bytes)}`,
+        });
+
+        const children = node.createDiv({ cls: "obsync-tree-children" });
+        let open = depth === 0 || files.length <= AUTO_EXPAND_FILES;
+        const apply = () => {
+          setIcon(caret, open ? "chevron-down" : "chevron-right");
+          children.toggle(open);
+          row.setAttr("aria-expanded", String(open));
+        };
+        const flip = () => {
+          open = !open;
+          apply();
+        };
+        caret.addEventListener("click", flip);
+        label.addEventListener("click", flip);
+        apply();
+
+        renderFolder(children, sub, depth + 1);
+      }
+
+      for (const file of folder.files) {
+        if (rendered >= MAX_ROWS) return;
+        rendered++;
+        const item = file.value;
+        const row = el.createDiv({ cls: "obsync-tree-row obsync-tree-file" });
+        // An empty caret keeps files aligned with their sibling folders.
+        row.createSpan({ cls: "obsync-tree-caret" });
+        if (selection) {
+          const box = row.createEl("input", { type: "checkbox" });
+          box.checked = selection.st.selected.has(file.path);
+          box.addEventListener("change", () => select([file.path], box.checked));
+        }
+        setIcon(row.createSpan({ cls: "obsync-tree-icon" }), "file");
+        const label = row.createDiv({ cls: "obsync-label" });
+        label.createSpan({ cls: "obsync-path", text: file.name });
+        label.createSpan({ cls: "obsync-muted", text: ` ${item.reason}` });
+        if (!selection) row.createSpan({ cls: "obsync-tag", text: tagFor(item) });
+      }
+    };
+
+    renderFolder(list, buildTree(items, (i) => i.entry.path), 0);
+    syncFolderBoxes();
+    overflow(parent, items.length);
   }
 
   private updateCount(id: number) {
