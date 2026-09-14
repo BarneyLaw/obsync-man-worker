@@ -1,6 +1,7 @@
 // Command obsync-worker pulls Canvas course files into the store.
 //
-//	obsync-worker run      scheduled pass over every active course (what the CronJob runs)
+//	obsync-worker run      scheduled pass over every active course, or only those
+//	                       -course names (what the CronJob runs)
 //	obsync-worker pull     manual pull outside the schedule, optionally scoped to
 //	                       courses, directories and files
 //	obsync-worker courses  list active Canvas courses and whether their files are reachable
@@ -78,6 +79,9 @@ func usage() {
 
 commands:
   run       scheduled pass over every active course (what the CronJob runs)
+              -course CS3103,LAG1201  only these courses; one that does not resolve
+                                      fails the run after the others have synced
+              -dry-run                plan and log every decision, write nothing
   pull      manual pull outside the schedule
               -course CS3103          one or more courses, by code or numeric id
               -path "Week 1"          only these directories, files or globs (needs -course)
@@ -137,10 +141,10 @@ func cmdPass(cmd string, args []string) int {
 	paths := &listFlag{}
 	var dryRun bool
 	var wait time.Duration
+	fs.Var(courses, "course", "only these courses, by course code or numeric id (repeatable, comma-separated)")
+	fs.BoolVar(&dryRun, "dry-run", false, "list and plan, log every decision, download and write nothing")
 	if cmd == "pull" {
-		fs.Var(courses, "course", "course to pull, by course code or numeric id (repeatable, comma-separated)")
 		fs.Var(paths, "path", "restrict the pull to a directory, file or glob inside the course (repeatable)")
-		fs.BoolVar(&dryRun, "dry-run", false, "list and plan, log every decision, download and write nothing")
 		fs.DurationVar(&wait, "wait", 0, "if another run holds the lease, wait up to this long")
 	}
 	if err := fs.Parse(args); err != nil {
@@ -259,10 +263,27 @@ func cmdPass(cmd string, args []string) int {
 		log.Error("run.list_courses_failed", "err", err)
 		return p.finish("failed", exitFailed, err)
 	}
-	selected, err := canvas.SelectCourses(all, courses.vals)
-	if err != nil {
-		log.Error("run.course_selection_invalid", "err", err)
-		return p.finish("failed", exitUsage, err)
+	// A manual pull names courses someone just typed, so a selector that does not
+	// resolve is a usage error and nothing runs. A scheduled run's list is config
+	// that goes stale as semesters end: it syncs the courses that do resolve,
+	// then exits failed so ObsyncWorkerLastRunFailed says the list needs editing.
+	var selected []canvas.Course
+	selectorsUnresolved := false
+	if cmd == "pull" {
+		selected, err = canvas.SelectCourses(all, courses.vals)
+		if err != nil {
+			log.Error("run.course_selection_invalid", "err", err)
+			return p.finish("failed", exitUsage, err)
+		}
+	} else {
+		var problems []error
+		selected, problems = canvas.ResolveCourses(all, courses.vals)
+		for _, perr := range problems {
+			log.Error("run.course_selector_unresolved", "err", perr,
+				"effect", "the courses that resolved still run; this run exits failed",
+				"hint", "edit -course in the CronJob args")
+		}
+		selectorsUnresolved = len(problems) > 0
 	}
 	codes := make([]string, len(selected))
 	for i, co := range selected {
@@ -275,6 +296,7 @@ func cmdPass(cmd string, args []string) int {
 		planned                                  int
 		unmatched                                = map[string]int{}
 	)
+	failed = selectorsUnresolved
 	for _, co := range selected {
 		res := run.CourseResult{CourseID: co.ID, Code: co.Code, Name: co.Name}
 		if stopping || ctx.Err() != nil {
