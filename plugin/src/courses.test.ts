@@ -45,8 +45,14 @@ describe("checkCourses", () => {
   });
 
   it("keeps the typed order however the lookups finish", async () => {
-    const results = await checkCourses([3, 1, 2], (id) =>
-      new Promise((resolve) => setTimeout(() => resolve(id === 1 ? manifest(id) : null), 5 * id)));
-    expect(results.map((r) => r.id)).toEqual([3, 1, 2]);
+    const finish = new Map<number, (m: Manifest | null) => void>();
+    const pending = checkCourses([3, 1, 2], (id) => new Promise((resolve) => finish.set(id, resolve)));
+
+    // Settle the lookups in a different order from the one typed.
+    finish.get(2)?.(null);
+    finish.get(1)?.(manifest(1));
+    finish.get(3)?.(null);
+
+    expect((await pending).map((r) => r.id)).toEqual([3, 1, 2]);
   });
 });
