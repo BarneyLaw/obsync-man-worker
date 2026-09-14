@@ -314,28 +314,37 @@ record. Canvas is the source of truth and the whole bucket is reconstructible by
 rerunning the worker. Three nodes is a learning goal, not a phase-1 requirement.
 Single-node Garage would be defensible.
 
-**Worker.** CronJob, `concurrencyPolicy: Forbid`, `startingDeadlineSeconds`,
-`backoffLimit: 2`. Forbid is load-bearing, not a nicety.
+**Worker.** CronJob, daily at 18:17 `Asia/Singapore` (`timeZone`, so the
+controller's UTC clock does not shift it to 02:17), `concurrencyPolicy:
+Forbid`, `startingDeadlineSeconds`, `backoffLimit: 2`, `activeDeadlineSeconds`
+below the lease TTL. Forbid is load-bearing, not a nicety. Run on demand with
+`kubectl create job --from=cronjob/obsync-worker` or Argo CD's Create Job
+action; the store lease holds that off a scheduled run.
+
+**GitOps.** `deploy/` mirrors `apps/` and `argocd/` in homelab-cicd-config. On
+`main`, CI publishes `ghcr.io/barneylaw/obsync-worker:<sha>`, bootstraps any of
+those files that are absent, and bumps the kustomize image tag, the same
+contract as lag-app. After the first deploy the config repo is the source of
+truth for schedule, rules and Garage config.
 
 **Secrets.** Canvas token and Garage keys via sealed-secrets. Vault is not
 actually running in the homelab despite the original spec, and sealed-secrets is
 the right weight: encrypted values commit to the Argo repo, the controller
 decrypts in-cluster, nothing extra to keep alive.
 
-**Metrics.** A CronJob's pod exits, so Prometheus will never scrape it. Two
-options: Pushgateway (batch jobs are the one case it is genuinely designed for,
-and a persisted `last_success_timestamp` is exactly what a staleness alert
-needs), or flip the worker to a Deployment with an internal ticker so it can be
-scraped directly. The Deployment is simpler to monitor but loses Kubernetes
-retry semantics and forces you to rebuild the single-writer guarantee yourself.
-**Take Pushgateway, keep Forbid.**
+**Metrics.** A CronJob's pod exits, so Prometheus will never scrape it. The
+original plan was a Pushgateway, but the cluster does not run one, and it does
+run kube-state-metrics, which already publishes the CronJob's last schedule and
+last success times without the worker exporting anything. **Alert from
+kube-state-metrics, keep Forbid.** If per-run counters (files fetched, bytes)
+are ever wanted on a dashboard, that is the point to add a Pushgateway.
 
-The alert that matters:
+The alert that matters, with a daily schedule plus slack:
 
 ```yaml
-alert: ObsyncStale
-expr: time() - obsync_last_success_timestamp_seconds > 86400
-for: 1h
+alert: ObsyncWorkerStale
+expr: time() - max(kube_cronjob_status_last_successful_time{namespace="obsync", cronjob="obsync-worker"}) > 26 * 3600
+for: 30m
 ```
 
 Everything else is a counter you look at once that fires.
@@ -461,7 +470,8 @@ Each step is useful on its own.
    GET, store conformance, presign and a full worker pass run against Garage
    v2.3.0 locally (`scripts/garage-dev.sh`) and in CI. `obsync serve` fronts any
    backend, so the plugin reads Garage without credentials.*
-6. **CronJob, Pushgateway, staleness alert.**
+6. **CronJob, staleness alert.** *Manifests, image and GitOps pipeline ready
+   in `deploy/`; alerts use kube-state-metrics, not a Pushgateway.*
 7. **Plugin**: types + policy + preview first (pure, no Obsidian mocks needed),
    then transport, then the sync loop, then UI.
 8. **Request bucket**, only if the ConfigMap workflow annoys you.

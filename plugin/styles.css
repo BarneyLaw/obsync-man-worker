@@ -117,6 +117,101 @@
   width: 100%;
 }
 
+/* File trees: folders first, collapsible, one indent guide per level. */
+.obsync-view .obsync-tree-row {
+  display: flex;
+  align-items: center;
+  gap: var(--size-2-2);
+  padding: var(--size-2-1) 0;
+  min-width: 0;
+}
+
+.obsync-view .obsync-tree-row input[type="checkbox"] {
+  flex: 0 0 auto;
+  margin: 0;
+}
+
+.obsync-view .obsync-tree-caret,
+.obsync-view .obsync-tree-icon {
+  flex: 0 0 auto;
+  display: inline-flex;
+  width: var(--icon-xs);
+  height: var(--icon-xs);
+  color: var(--text-muted);
+}
+
+.obsync-view .obsync-tree-row svg {
+  width: var(--icon-xs);
+  height: var(--icon-xs);
+}
+
+.obsync-view .obsync-tree-caret,
+.obsync-view .obsync-tree-toggle {
+  cursor: pointer;
+}
+
+.obsync-view .obsync-tree-name {
+  font-weight: var(--font-medium);
+}
+
+.obsync-view .obsync-tree-all {
+  padding-bottom: var(--size-2-2);
+  border-bottom: 1px solid var(--background-modifier-border);
+  margin-bottom: var(--size-2-1);
+}
+
+/* What a pull would do to each file, readable at a glance. */
+.obsync-view .obsync-tag-new {
+  color: var(--text-accent);
+}
+
+.obsync-view .obsync-tag-changed {
+  color: var(--text-warning);
+}
+
+.obsync-view .obsync-tag-missing {
+  color: var(--text-error);
+}
+
+.obsync-view .obsync-tree-children {
+  margin-left: calc(var(--icon-xs) / 2);
+  padding-left: var(--size-4-2);
+  border-left: 1px solid var(--background-modifier-border);
+}
+
+/* Setup: one line per course ID after it is checked against the store. */
+.obsync-course-report {
+  display: flex;
+  flex-direction: column;
+  gap: var(--size-2-1);
+  padding-bottom: var(--size-4-2);
+  font-size: var(--font-ui-small);
+}
+
+.obsync-course-report-row {
+  display: flex;
+  align-items: center;
+  gap: var(--size-2-2);
+}
+
+.obsync-course-report-icon {
+  display: inline-flex;
+  flex: 0 0 auto;
+}
+
+.obsync-course-report-icon svg {
+  width: var(--icon-xs);
+  height: var(--icon-xs);
+}
+
+.obsync-ok {
+  color: var(--text-success);
+}
+
+.obsync-warning {
+  color: var(--text-warning);
+}
+
 .obsync-error {
   color: var(--text-error);
 }

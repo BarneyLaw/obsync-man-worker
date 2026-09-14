@@ -63,12 +63,16 @@ type Entry struct {
 }
 
 type Manifest struct {
-	SchemaVersion int       `json:"schema_version"`
-	CourseID      int64     `json:"course_id"`
-	CourseName    string    `json:"course_name"`
-	RunID         string    `json:"run_id"`
-	PrevRunID     string    `json:"prev_run_id,omitempty"`
-	GeneratedAt   time.Time `json:"generated_at"`
+	SchemaVersion int    `json:"schema_version"`
+	CourseID      int64  `json:"course_id"`
+	CourseName    string `json:"course_name"`
+	// CourseCode is Canvas's course code, e.g. "CS3103". Consumers name the
+	// course's folder with it. Empty in manifests from workers that predate it,
+	// which is why it is optional rather than a schema version bump.
+	CourseCode  string    `json:"course_code,omitempty"`
+	RunID       string    `json:"run_id"`
+	PrevRunID   string    `json:"prev_run_id,omitempty"`
+	GeneratedAt time.Time `json:"generated_at"`
 
 	// RulesHash identifies the worker rule set that produced this manifest.
 	// When it changes, previously skipped entries must be re-evaluated.

@@ -1,6 +1,6 @@
 import { Manifest, Entry, liveEntries, SCOPE_RULE } from "./types";
 import { Policy, evaluate, humanBytes } from "./policy";
-import { LocalState } from "./state";
+import { FileRecord } from "./state";
 
 /**
  * The payoff of cataloguing skipped files instead of dropping them: this is a
@@ -13,6 +13,8 @@ export interface PreviewItem {
   action:
     | "download"
     | "update"
+    /** Written by this device, since deleted from the vault. Only a user-started pull puts it back. */
+    | "restore"
     | "have"
     | "skip-local"
     | "skip-worker"
@@ -22,8 +24,14 @@ export interface PreviewItem {
   reason: string;
 }
 
+/** Items a pull can write: new, changed, or deleted from the vault. */
+export function isPullable(item: PreviewItem): boolean {
+  return item.action === "download" || item.action === "update" || item.action === "restore";
+}
+
 export interface Preview {
   items: PreviewItem[];
+  /** Everything a manual pull would write: downloads, updates and restores. */
   toDownload: number;
   bytesToDownload: number;
   alreadyHave: number;
@@ -34,18 +42,30 @@ export interface Preview {
   locked: number;
 }
 
-export function preview(m: Manifest, p: Policy, state: LocalState): Preview {
+/**
+ * @param files - what this device wrote for this manifest's course, by path.
+ * @param missing - paths this device recorded as written that are no longer in
+ *   the vault (Syncer.missingFiles). The only non-pure input, passed in so this
+ *   stays a function of its arguments.
+ */
+export function preview(
+  m: Manifest,
+  p: Policy,
+  files: Readonly<Record<string, FileRecord>>,
+  missing: ReadonlySet<string> = new Set(),
+): Preview {
   const out: Preview = {
     items: [], toDownload: 0, bytesToDownload: 0,
     alreadyHave: 0, skippedLocal: 0, skippedWorker: 0, deferred: 0, locked: 0,
   };
 
   for (const e of liveEntries(m)) {
-    const item = classify(e, m.course_id, p, state);
+    const item = classify(e, m.course_id, p, files, missing);
     out.items.push(item);
     switch (item.action) {
       case "download":
       case "update":
+      case "restore":
         out.toDownload++;
         out.bytesToDownload += e.size;
         break;
@@ -59,7 +79,13 @@ export function preview(m: Manifest, p: Policy, state: LocalState): Preview {
   return out;
 }
 
-function classify(e: Entry, courseId: number, p: Policy, state: LocalState): PreviewItem {
+function classify(
+  e: Entry,
+  courseId: number,
+  p: Policy,
+  files: Readonly<Record<string, FileRecord>>,
+  missing: ReadonlySet<string>,
+): PreviewItem {
   if (e.state === "locked") {
     const when = e.unlock_at ? new Date(e.unlock_at).toLocaleString() : "unknown";
     return { entry: e, action: "locked", reason: `unlocks ${when}` };
@@ -88,7 +114,13 @@ function classify(e: Entry, courseId: number, p: Policy, state: LocalState): Pre
   // something: a stand-in name for an unportable Canvas filename, or a failed
   // refresh that means an older version is being served.
   const note = e.reason ? ` (${e.reason})` : "";
-  const known = state.files[e.path];
+  const known = files[e.path];
+  if (known && missing.has(e.path)) {
+    // Recorded as written, but gone from the vault: usually the user deleted
+    // it. Offered in the panel, but automatic pulls leave it alone so a
+    // deletion is not undone behind the user's back.
+    return { entry: e, action: "restore", reason: `missing from the vault, ${humanBytes(e.size)}${note}` };
+  }
   if (known && known.sha256 === e.sha256) {
     return { entry: e, action: "have", reason: `up to date${note}` };
   }

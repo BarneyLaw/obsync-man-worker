@@ -1,5 +1,6 @@
-# Validates the Go half of obsync: the worker, the inspection CLI, and the
-# contract fixtures in schema/ that the plugin reads.
+# Validates the Go half of obsync, builds the worker image, and on main
+# publishes it and updates BarneyLaw/homelab-cicd-config, the same GitOps
+# contract as lag-app.
 #
 # Triggers on worker changes, and on any change to the worker<->plugin
 # contract from EITHER side, because the two ship as a pair. The contract block
@@ -16,8 +17,11 @@ on:
       - 'internal/**'
       - 'go.mod'
       - 'go.sum'
-      - 'deploy/rules.json'
+      - 'Dockerfile'
+      - '.dockerignore'
+      - 'deploy/**'
       - 'scripts/garage-dev.sh'
+      - 'scripts/render-deploy.sh'
       - '.github/workflows/worker.yml'
       # contract (identical in plugin.yml)
       - 'schema/**'
@@ -38,8 +42,11 @@ on:
       - 'internal/**'
       - 'go.mod'
       - 'go.sum'
-      - 'deploy/rules.json'
+      - 'Dockerfile'
+      - '.dockerignore'
+      - 'deploy/**'
       - 'scripts/garage-dev.sh'
+      - 'scripts/render-deploy.sh'
       - '.github/workflows/worker.yml'
       # contract (identical in plugin.yml)
       - 'schema/**'
@@ -60,7 +67,9 @@ permissions:
 
 concurrency:
   group: worker-${{ github.ref }}
-  cancel-in-progress: true
+  # Cancel superseded pull request runs only. A push to main may be mid-way
+  # through pushing to homelab-cicd-config and must finish.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   validate:
@@ -116,6 +125,16 @@ jobs:
           mkdir -p "$RUNNER_TEMP/store"
           ./bin/obsync -fs-store "$RUNNER_TEMP/store" ls
 
+      - name: Render deployment manifests
+        env:
+          RENDER_OUT: ${{ runner.temp }}/rendered
+        run: |
+          scripts/render-deploy.sh deploy/apps/garage-obsync deploy/apps/obsync-worker
+          cronjob="$RENDER_OUT/obsync-worker.yaml"
+          grep -q 'schedule: 17 18 \* \* \*' "$cronjob"
+          grep -q 'timeZone: Asia/Singapore' "$cronjob"
+          grep -q 'concurrencyPolicy: Forbid' "$cronjob"
+
   garage:
     name: S3 integration against Garage
     runs-on: ubuntu-latest
@@ -158,3 +177,196 @@ jobs:
       - name: Garage logs
         if: failure()
         run: docker logs --tail 200 obsync-garage
+
+  container:
+    name: Build and smoke-test image
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build image
+        run: docker build -t obsync-worker:ci .
+
+      # The CronJob runs as 65532 with a read-only root filesystem and an
+      # emptyDir on /tmp. Smoke-test under the same constraints.
+      - name: Smoke-test the image
+        run: |
+          set -euo pipefail
+          docker run --rm --read-only obsync-worker:ci help
+
+          # No Canvas or Garage configuration: must refuse with exit 2 rather
+          # than start and do something half-configured.
+          set +e
+          docker run --rm --read-only --tmpfs /tmp obsync-worker:ci run -rules=/nonexistent
+          code=$?
+          set -e
+          if [ "$code" != 2 ]; then
+            echo "::error::worker without configuration exited $code, want 2"
+            exit 1
+          fi
+
+          docker run --rm --read-only --tmpfs /tmp --entrypoint /usr/local/bin/obsync \
+            obsync-worker:ci -fs-store /tmp ls
+
+  deploy:
+    name: Publish image and update GitOps
+    needs:
+      - validate
+      - garage
+      - container
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' ||
+      github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Require GitOps repository token
+        shell: bash
+        env:
+          CONFIG_REPO_TOKEN: ${{ secrets.CONFIG_REPO_TOKEN }}
+        run: |
+          if [ -z "$CONFIG_REPO_TOKEN" ]; then
+            echo "::error::Add CONFIG_REPO_TOKEN with Contents: read/write access to homelab-cicd-config."
+            exit 1
+          fi
+
+      - name: Check out tested commit
+        uses: actions/checkout@v6
+
+      - name: Compute image coordinates
+        id: image
+        shell: bash
+        run: |
+          owner=$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')
+          echo "name=ghcr.io/${owner}/obsync-worker" >> "$GITHUB_OUTPUT"
+          echo "tag=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract image metadata
+        id: metadata
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.name }}
+          tags: |
+            type=sha,prefix=,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64
+          tags: ${{ steps.metadata.outputs.tags }}
+          labels: ${{ steps.metadata.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Check out GitOps repository
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ github.repository_owner }}/homelab-cicd-config
+          token: ${{ secrets.CONFIG_REPO_TOKEN }}
+          path: config
+
+      # Files are copied only where absent. Once bootstrapped,
+      # homelab-cicd-config is the deployment source of truth: releases change
+      # only the image tag, and sealed secrets, schedule or rules edits made
+      # there are never overwritten from here.
+      - name: Bootstrap obsync GitOps files when absent
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p config/apps config/argocd
+          for app in garage-obsync obsync-worker; do
+            while IFS= read -r file; do
+              dst="config/apps/$app/$file"
+              if [ ! -f "$dst" ]; then
+                mkdir -p "$(dirname "$dst")"
+                cp "deploy/apps/$app/$file" "$dst"
+                echo "bootstrapped apps/$app/$file"
+              fi
+            done < <(cd "deploy/apps/$app" && find . -type f | sed 's|^\./||')
+
+            if [ ! -f "config/argocd/$app.yaml" ]; then
+              cp "deploy/argocd/$app.yaml" "config/argocd/$app.yaml"
+              echo "bootstrapped argocd/$app.yaml"
+            fi
+          done
+
+      - name: Install Kustomize
+        shell: bash
+        env:
+          KUSTOMIZE_VERSION: v5.7.1
+          KUSTOMIZE_SHA256: ea375e7372f9aa029129d4b2d16c66b7750b7f1213c4f66f910d981c895818d8
+        run: |
+          set -euo pipefail
+
+          url="https://github.com/kubernetes-sigs/kustomize/releases/download"
+          url="${url}/kustomize%2F${KUSTOMIZE_VERSION}"
+          url="${url}/kustomize_${KUSTOMIZE_VERSION}_linux_amd64.tar.gz"
+
+          curl -fsSL --retry 3 --retry-delay 5 --retry-all-errors \
+            -o kustomize.tar.gz "$url"
+          echo "${KUSTOMIZE_SHA256}  kustomize.tar.gz" | sha256sum -c -
+          tar -xzf kustomize.tar.gz kustomize
+          sudo install -m 0755 kustomize /usr/local/bin/kustomize
+          rm -f kustomize kustomize.tar.gz
+
+      - name: Update obsync-worker image tag
+        working-directory: config/apps/obsync-worker
+        shell: bash
+        env:
+          IMAGE_NAME: ${{ steps.image.outputs.name }}
+          IMAGE_TAG: ${{ steps.image.outputs.tag }}
+        run: kustomize edit set image "${IMAGE_NAME}=${IMAGE_NAME}:${IMAGE_TAG}"
+
+      - name: Validate GitOps deployment
+        shell: bash
+        env:
+          RENDER_OUT: ${{ runner.temp }}/gitops
+          IMAGE_NAME: ${{ steps.image.outputs.name }}
+          IMAGE_TAG: ${{ steps.image.outputs.tag }}
+        run: |
+          set -euo pipefail
+          scripts/render-deploy.sh config/apps/garage-obsync config/apps/obsync-worker
+          if ! grep -q "image: ${IMAGE_NAME}:${IMAGE_TAG}" "$RENDER_OUT/obsync-worker.yaml"; then
+            echo "::error::rendered obsync-worker does not use ${IMAGE_NAME}:${IMAGE_TAG}"
+            exit 1
+          fi
+
+      - name: Commit and push GitOps update
+        working-directory: config
+        shell: bash
+        env:
+          IMAGE_TAG: ${{ steps.image.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add apps/garage-obsync apps/obsync-worker argocd/garage-obsync.yaml argocd/obsync-worker.yaml
+
+          if git diff --cached --quiet; then
+            echo "GitOps is already up to date"
+            exit 0
+          fi
+
+          git commit -m "deploy: obsync-worker ${IMAGE_TAG}"
+          git pull --rebase origin main
+          git push origin HEAD:main

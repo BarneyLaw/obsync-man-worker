@@ -18,23 +18,56 @@ export interface FileRecord {
   writtenAt: number;
 }
 
-export interface LocalState {
-  version: 1;
-  lastRunId: Record<string, string>; // courseId -> run_id
-  files: Record<string, FileRecord>; // vault-relative path -> record
+/** What this device wrote for one course. */
+export interface CourseRecord {
+  /**
+   * The folder, under the target folder, the course's files were last placed
+   * in. Lets a renamed folder be moved instead of downloaded again.
+   */
+  folder?: string;
+  /** Manifest path -> record. */
+  files: Record<string, FileRecord>;
+  /**
+   * Ticks the user changed in the panel, by manifest path: true to pull, false
+   * to leave out. Kept until the file is pulled, so an untick survives restarts
+   * and every automatic pull.
+   */
+  choices?: Record<string, boolean>;
 }
 
-export const emptyState = (): LocalState => ({ version: 1, lastRunId: {}, files: {} });
+export interface LocalState {
+  version: 2;
+  lastRunId: Record<string, string>; // courseId -> run_id
+  courses: Record<string, CourseRecord>; // courseId -> what was written
+  /**
+   * Records from version 1, when every course shared the target folder and
+   * files were keyed by path alone. The next sync of a course whose manifest
+   * lists a path moves that file into the course's folder and takes the record.
+   */
+  legacyFiles: Record<string, FileRecord>;
+}
+
+export const emptyState = (): LocalState => ({ version: 2, lastRunId: {}, courses: {}, legacyFiles: {} });
+
+interface StateV1 {
+  version: 1;
+  lastRunId?: Record<string, string>;
+  files?: Record<string, FileRecord>;
+}
 
 export async function loadState(plugin: Plugin): Promise<LocalState> {
-  const raw = (await plugin.loadData()) as { state?: LocalState } | null;
+  const raw = (await plugin.loadData()) as { state?: StateV1 | Partial<LocalState> } | null;
   const s = raw?.state;
-  if (!s || s.version !== 1) return emptyState();
+  if (s?.version === 1) {
+    return { version: 2, lastRunId: s.lastRunId ?? {}, courses: {}, legacyFiles: s.files ?? {} };
+  }
+  if (s?.version !== 2) return emptyState();
   // Tolerate a half-written data.json rather than throwing during onload.
   return {
-    version: 1,
+    version: 2,
     lastRunId: s.lastRunId ?? {},
-    files: s.files ?? {},
+    courses: s.courses ?? {},
+    legacyFiles: s.legacyFiles ?? {},
   };
 }
 

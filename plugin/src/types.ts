@@ -45,6 +45,8 @@ export interface Manifest {
   schema_version: number;
   course_id: number;
   course_name: string;
+  /** e.g. "CS3103". Absent in manifests from workers that predate it. */
+  course_code?: string;
   run_id: string;
   prev_run_id?: string;
   generated_at: string;

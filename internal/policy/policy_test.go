@@ -167,12 +167,12 @@ func TestParseAcceptsComments(t *testing.T) {
 }
 
 func TestDeployedWorkerRulesParse(t *testing.T) {
-	raw, err := os.ReadFile(filepath.Join("..", "..", "deploy", "rules.json"))
+	raw, err := os.ReadFile(filepath.Join("..", "..", "deploy", "apps", "obsync-worker", "rules.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := Parse(raw); err != nil {
-		t.Fatalf("deploy/rules.json does not parse: %v", err)
+		t.Fatalf("deploy/apps/obsync-worker/rules.json does not parse: %v", err)
 	}
 }
 
@@ -202,7 +202,7 @@ func TestGoldenFixture(t *testing.T) {
 	if err := json.Unmarshal(raw, &g); err != nil {
 		t.Fatal(err)
 	}
-	// Strict parse, the same path deploy/rules.json takes.
+	// Strict parse, the same path the deployed worker rules take.
 	p, err := Parse(g.Policy)
 	if err != nil {
 		t.Fatal(err)

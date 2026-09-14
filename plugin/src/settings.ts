@@ -1,5 +1,6 @@
-import { App, PluginSettingTab, Setting, Plugin } from "obsidian";
+import { App, PluginSettingTab, Setting, Plugin, setIcon } from "obsidian";
 import { Policy, validate } from "./policy";
+import { CourseCheck, parseCourseIds, sameIds } from "./courses";
 
 export interface ObsyncSettings {
   baseUrl: string;
@@ -36,6 +37,10 @@ export type ObsyncPluginLike = Plugin & {
   settings: ObsyncSettings;
   save(): Promise<void>;
   rescheduleSync(): void;
+  /** Look each course ID up in the store. */
+  checkCourses(ids: number[]): Promise<CourseCheck[]>;
+  /** The last lookup, so its report survives the panel re-rendering. */
+  courseCheck?: { ids: number[]; results: CourseCheck[] };
 };
 
 const COURSES_DESC =
@@ -93,24 +98,50 @@ export function renderSettings(
 
   // Without this the plugin has nothing to pull and no way to be told what to
   // pull. It is the one setting that cannot be defaulted.
+  //
+  // Typing only checks the format, quietly: nothing is saved, nothing reloads,
+  // no notices. Saving on every keystroke reloaded the whole panel, which
+  // closed this form and raised "add a course ID" while the field was empty.
+  // Enter, or leaving the field, saves the list and looks each ID up.
   const courses = new Setting(containerEl).setName("Course IDs").setDesc(COURSES_DESC);
-  courses.addText((t) =>
-    t
-      .setPlaceholder("12345, 67890")
-      .setValue(plugin.settings.courses.join(", "))
-      .onChange(async (v) => {
-        const { ids, bad } = parseCourseIds(v);
-        courses.setDesc(
-          bad.length > 0
-            ? `Not a course ID: ${bad.join(", ")}. Use comma-separated numbers.`
-            : COURSES_DESC,
-        );
-        courses.descEl.toggleClass("obsync-error", bad.length > 0);
-        plugin.settings.courses = ids;
-        await plugin.save();
-        onCoursesChanged?.();
-      }),
-  );
+  const report = containerEl.createDiv({ cls: "obsync-course-report" });
+  const cached = plugin.courseCheck;
+  if (cached && sameIds(cached.ids, plugin.settings.courses)) {
+    renderCourseReport(report, cached.results, []);
+  }
+
+  courses.addText((t) => {
+    t.setPlaceholder("93794, 77826").setValue(plugin.settings.courses.join(", "));
+    t.onChange((v) => {
+      const { bad } = parseCourseIds(v);
+      courses.setDesc(
+        bad.length > 0 ? `Not a course ID: ${bad.join(", ")}. Use numbers separated by commas.` : COURSES_DESC,
+      );
+      courses.descEl.toggleClass("obsync-error", bad.length > 0);
+    });
+    t.inputEl.addEventListener("change", () => {
+      void (async () => {
+        const { ids, bad } = parseCourseIds(t.getValue());
+        const changed = !sameIds(ids, plugin.settings.courses);
+        if (changed) {
+          plugin.settings.courses = ids;
+          await plugin.save();
+        }
+        report.empty();
+        if (ids.length === 0) {
+          plugin.courseCheck = undefined;
+          renderCourseReport(report, [], bad);
+        } else {
+          report.createDiv({ cls: "obsync-muted", text: "Checking the store..." });
+          const results = await plugin.checkCourses(ids);
+          plugin.courseCheck = { ids, results };
+          renderCourseReport(report, results, bad);
+        }
+        // Reload the panel once, and only if the list really changed.
+        if (changed) onCoursesChanged?.();
+      })();
+    });
+  });
 
   new Setting(containerEl).setName("Folders").setHeading();
 
@@ -170,8 +201,16 @@ export function renderSettings(
   const rules = new Setting(containerEl)
     .setName("Exclusion rules (JSON)")
     .setDesc(RULES_DESC);
-  rules.addTextArea((t) =>
-    t.setValue(JSON.stringify(plugin.settings.policy, null, 2)).onChange(async (v) => {
+  // Valid rules are saved as you type, but the panel reloads only once you
+  // leave the field, for the same reason as the course IDs.
+  let rulesChanged = false;
+  rules.addTextArea((t) => {
+    t.inputEl.addEventListener("change", () => {
+      if (!rulesChanged) return;
+      rulesChanged = false;
+      onCoursesChanged?.();
+    });
+    return t.setValue(JSON.stringify(plugin.settings.policy, null, 2)).onChange(async (v) => {
       let parsed: Policy;
       try {
         parsed = JSON.parse(v) as Policy;
@@ -192,9 +231,34 @@ export function renderSettings(
       rules.descEl.removeClass("obsync-error");
       plugin.settings.policy = parsed;
       await plugin.save();
-      onCoursesChanged?.();
-    }),
-  );
+      rulesChanged = true;
+    });
+  });
+}
+
+/** One line per course ID: found with its name, not found, or not checkable. */
+function renderCourseReport(el: HTMLElement, results: CourseCheck[], bad: string[]) {
+  el.empty();
+  const line = (icon: string, cls: string, text: string) => {
+    const row = el.createDiv({ cls: `obsync-course-report-row ${cls}` });
+    setIcon(row.createSpan({ cls: "obsync-course-report-icon" }), icon);
+    row.createSpan({ text });
+  };
+  for (const r of results) {
+    switch (r.status) {
+      case "found":
+        line("check", "obsync-ok", `${r.id}: ${r.name}`);
+        break;
+      case "missing":
+        line("x", "obsync-error",
+          `${r.id}: not in the store. Check the ID, or run the worker for this course first.`);
+        break;
+      case "error":
+        line("alert-triangle", "obsync-warning", `${r.id}: could not check (${r.message})`);
+        break;
+    }
+  }
+  for (const b of bad) line("x", "obsync-error", `"${b}" is not a course ID`);
 }
 
 export class ObsyncSettingTab extends PluginSettingTab {
@@ -206,19 +270,4 @@ export class ObsyncSettingTab extends PluginSettingTab {
     this.containerEl.empty();
     renderSettings(this.containerEl, this.plugin);
   }
-}
-
-/** Split on commas/whitespace, keep the positive integers, report the rest. */
-export function parseCourseIds(raw: string): { ids: number[]; bad: string[] } {
-  const ids: number[] = [];
-  const bad: string[] = [];
-  for (const tok of raw.split(/[,\s]+/).filter((s) => s.length > 0)) {
-    const n = Number(tok);
-    if (Number.isInteger(n) && n > 0) {
-      if (!ids.includes(n)) ids.push(n);
-    } else {
-      bad.push(tok);
-    }
-  }
-  return { ids, bad };
 }

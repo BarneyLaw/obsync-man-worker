@@ -4,6 +4,8 @@ import { LocalState, loadState, saveState, emptyState } from "./state";
 import { RemoteStore } from "./store";
 import { Syncer, notifyResult } from "./sync";
 import { ObsyncView, VIEW_TYPE_OBSYNC } from "./ui/ObsyncView";
+import { widenRightSidebar } from "./ui/layout";
+import { CourseCheck, checkCourses } from "./courses";
 
 export default class ObsyncPlugin extends Plugin {
   settings: ObsyncSettings = DEFAULT_SETTINGS;
@@ -14,6 +16,8 @@ export default class ObsyncPlugin extends Plugin {
   private running = false;
   private status = "idle";
   private statusListeners = new Set<(text: string) => void>();
+  /** The last course ID lookup, so Setup can show it again after a re-render. */
+  courseCheck?: { ids: number[]; results: CourseCheck[] };
 
   async onload() {
     const data = (await this.loadData()) as { settings?: ObsyncSettings } | null;
@@ -35,7 +39,7 @@ export default class ObsyncPlugin extends Plugin {
       id: "open-panel", name: "Open panel",
       callback: () => void this.activateView(),
     });
-    this.addCommand({ id: "pull", name: "Pull now", callback: () => void this.pullAll() });
+    this.addCommand({ id: "pull", name: "Pull now", callback: () => void this.pullAll({ manual: true }) });
 
     // Delay on load so plugin startup is not blocked by network.
     this.app.workspace.onLayoutReady(() => {
@@ -53,6 +57,9 @@ export default class ObsyncPlugin extends Plugin {
     if (!leaf) {
       leaf = workspace.getRightLeaf(false);
       await leaf?.setViewState({ type: VIEW_TYPE_OBSYNC, active: true });
+      // Only when the panel is first created, so a sidebar the user resizes
+      // afterwards stays the size they chose.
+      widenRightSidebar(this.app);
     }
     if (leaf) await workspace.revealLeaf(leaf);
   }
@@ -71,22 +78,33 @@ export default class ObsyncPlugin extends Plugin {
     await saveState(this, this.state, this.settings);
   }
 
-  makeSyncer(): Syncer | null {
+  /**
+   * @param opts.quiet - return null without a notice when setup is incomplete.
+   *   Only a pull the user asked for should nag; the panel and automatic pulls
+   *   explain themselves or stay silent.
+   */
+  makeSyncer(opts: { quiet?: boolean } = {}): Syncer | null {
     if (!this.settings.baseUrl) {
-      new Notice("obsync: set the store URL in the panel's Setup section first");
+      if (!opts.quiet) new Notice("obsync: set the store URL in the panel's Setup section first");
       return null;
     }
     if (this.settings.courses.length === 0) {
-      new Notice("obsync: add at least one course ID in the panel's Setup section");
+      if (!opts.quiet) new Notice("obsync: add at least one course ID in the panel's Setup section");
       return null;
     }
     const store = new RemoteStore({ baseUrl: this.settings.baseUrl, bucket: this.settings.bucket });
     return new Syncer(this, store, this.settings.policy, this.state, this.settings);
   }
 
-  async pullAll() {
+  /**
+   * @param opts.manual - the user asked for this pull (button or command), so
+   *   everything ticked in the panel is written. The automatic pulls on startup
+   *   and on the interval only refresh files the vault already has.
+   */
+  async pullAll(opts: { manual?: boolean } = {}) {
     if (this.running) return;
-    const s = this.makeSyncer();
+    const mode = opts.manual === true ? "manual" : "automatic";
+    const s = this.makeSyncer({ quiet: mode === "automatic" });
     if (!s) return;
     this.running = true;
     this.setStatus("syncing...");
@@ -98,9 +116,10 @@ export default class ObsyncPlugin extends Plugin {
         try {
           const m = await s.fetchManifest(courseId);
           if (!m) continue;
-          // Skip work when the worker has not published since we last looked.
-          if (this.state.lastRunId[String(courseId)] === m.run_id) continue;
-          notifyResult(await s.syncCourse(m));
+          // An automatic pull has nothing to refresh until the worker publishes
+          // a run this device has not seen.
+          if (mode === "automatic" && !(await s.needsSync(m))) continue;
+          notifyResult(await s.syncCourse(m, { mode }));
         } catch (e) {
           failed.push(courseId);
           console.error(`obsync: course ${courseId} failed`, e);
@@ -115,6 +134,16 @@ export default class ObsyncPlugin extends Plugin {
     } finally {
       this.running = false;
     }
+  }
+
+  /** Look each course ID up in the store, for the Setup form. Never raises a notice. */
+  async checkCourses(ids: number[]): Promise<CourseCheck[]> {
+    if (!this.settings.baseUrl) {
+      return ids.map((id): CourseCheck => ({ id, status: "error", message: "set the store URL first" }));
+    }
+    const store = new RemoteStore({ baseUrl: this.settings.baseUrl, bucket: this.settings.bucket });
+    const s = new Syncer(this, store, this.settings.policy, this.state, this.settings);
+    return checkCourses(ids, (id) => s.fetchManifest(id));
   }
 
   currentStatus(): string {

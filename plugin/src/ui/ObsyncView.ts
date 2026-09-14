@@ -1,19 +1,26 @@
-import { ItemView, WorkspaceLeaf, Notice, normalizePath } from "obsidian";
+import { ItemView, WorkspaceLeaf, Notice, normalizePath, setIcon } from "obsidian";
 import { Manifest } from "../types";
-import { Preview, PreviewItem } from "../preview";
+import { Preview, PreviewItem, isPullable } from "../preview";
 import { humanBytes } from "../policy";
 import { renderSettings, ObsyncPluginLike } from "../settings";
 import { Syncer, notifyResult } from "../sync";
+import { buildTree, filesUnder, TreeFolder } from "../tree";
 
 export const VIEW_TYPE_OBSYNC = "obsync-panel";
 
 /** Long lists get truncated: a semester is ~2000 entries and the DOM notices. */
 const MAX_ROWS = 300;
 
+/**
+ * Below the top level, a folder starts expanded only if it holds at most this
+ * many files, so a big course opens as an overview rather than a wall of rows.
+ */
+const AUTO_EXPAND_FILES = 12;
+
 /** What the plugin has to expose for the panel to drive it. */
 export type ObsyncHost = ObsyncPluginLike & {
-  makeSyncer(): Syncer | null;
-  pullAll(): Promise<void>;
+  makeSyncer(opts?: { quiet?: boolean }): Syncer | null;
+  pullAll(opts?: { manual?: boolean }): Promise<void>;
   onStatus(cb: (text: string) => void): () => void;
   currentStatus(): string;
 };
@@ -22,7 +29,14 @@ interface CourseState {
   manifest?: Manifest;
   preview?: Preview;
   error?: string;
+  /** Pullable paths currently ticked. Every change is also saved via Syncer.choose. */
   selected: Set<string>;
+}
+
+/** A checkbox and the file paths it stands for: one for a file, all beneath it for a folder. */
+interface Box {
+  box: HTMLInputElement;
+  paths: string[];
 }
 
 /**
@@ -35,9 +49,14 @@ interface CourseState {
  */
 export class ObsyncView extends ItemView {
   private courses = new Map<number, CourseState>();
+  private syncer: Syncer | null = null;
   private loading = false;
   private unsubscribe?: () => void;
   private statusEl?: HTMLElement;
+  // Which sections the user opened or closed, so a reload does not undo it.
+  private setupOpen = false;
+  private collapsedCourses = new Set<number>();
+  private openWithheld = new Set<number>();
 
   constructor(leaf: WorkspaceLeaf, private plugin: ObsyncHost) {
     super(leaf);
@@ -62,8 +81,13 @@ export class ObsyncView extends ItemView {
 
   /** Re-fetch every configured course's manifest, then re-render. */
   async refresh() {
-    const s = this.plugin.makeSyncer();
-    if (!s) return;
+    // Quiet: the panel explains an incomplete setup itself.
+    const s = this.plugin.makeSyncer({ quiet: true });
+    this.syncer = s;
+    if (!s) {
+      this.render();
+      return;
+    }
     this.loading = true;
     this.render();
 
@@ -76,8 +100,12 @@ export class ObsyncView extends ItemView {
           st.error = "no manifest published for this course yet";
         } else {
           st.manifest = m;
-          st.preview = s.previewCourse(m);
-          for (const i of pullable(st.preview)) st.selected.add(i.entry.path);
+          // Move files into this course's folder first, then check the vault,
+          // not just the record: a file deleted since it was pulled must show
+          // up as pullable again.
+          await s.migrateCourse(m);
+          st.preview = s.previewCourse(m, await s.missingFiles(m));
+          st.selected = s.selection(m, st.preview);
         }
       } catch (e) {
         // One unreachable course must not blank the whole panel.
@@ -108,9 +136,10 @@ export class ObsyncView extends ItemView {
 
     const bar = head.createDiv({ cls: "obsync-actions" });
     const pull = bar.createEl("button", { text: "Pull now", cls: "mod-cta" });
+    pull.setAttr("aria-label", "Pull everything ticked, in every course");
     pull.addEventListener("click", () => {
       void (async () => {
-        await this.plugin.pullAll();
+        await this.plugin.pullAll({ manual: true });
         await this.refresh();
       })();
     });
@@ -138,7 +167,12 @@ export class ObsyncView extends ItemView {
   }
 
   private renderCourse(parent: HTMLElement, id: number, st: CourseState) {
-    const details = parent.createEl("details", { cls: "obsync-course", attr: { open: "" } });
+    const details = parent.createEl("details", { cls: "obsync-course" });
+    details.open = !this.collapsedCourses.has(id);
+    details.addEventListener("toggle", () => {
+      if (details.open) this.collapsedCourses.delete(id);
+      else this.collapsedCourses.add(id);
+    });
     const name = st.manifest?.course_name ?? `Course ${id}`;
     details.createEl("summary", { text: name });
 
@@ -150,51 +184,52 @@ export class ObsyncView extends ItemView {
     const m = st.manifest;
     if (!p || !m) return;
 
-    const items = pullable(p);
+    const items = p.items.filter(isPullable);
+    const counts = { new: 0, changed: 0, missing: 0 };
+    for (const i of items) {
+      if (i.action === "download") counts.new++;
+      else if (i.action === "update") counts.changed++;
+      else counts.missing++;
+    }
+    const parts = [`${counts.new} new`, `${counts.changed} changed`];
+    if (counts.missing > 0) parts.push(`${counts.missing} missing from the vault`);
     details.createEl("p", {
       cls: "obsync-muted",
-      text:
-        `${p.toDownload} to pull (${humanBytes(p.bytesToDownload)}) · ` +
-        `${p.alreadyHave} up to date`,
+      text: `${parts.join(" · ")} · ${p.alreadyHave} up to date`,
     });
 
     if (items.length === 0) {
       details.createEl("p", { cls: "obsync-muted", text: "Everything here is current." });
     } else {
-      const list = details.createDiv({ cls: "obsync-list" });
-      for (const item of items.slice(0, MAX_ROWS)) {
-        const row = list.createDiv({ cls: "obsync-row" });
-        const cb = row.createEl("input", { type: "checkbox" });
-        cb.checked = st.selected.has(item.entry.path);
-        cb.addEventListener("change", () => {
-          if (cb.checked) st.selected.add(item.entry.path);
-          else st.selected.delete(item.entry.path);
-          this.updateCount(id);
-        });
-        const label = row.createDiv({ cls: "obsync-label" });
-        label.createSpan({ cls: "obsync-path", text: item.entry.path });
-        label.createSpan({ cls: "obsync-muted", text: ` ${item.reason}` });
-      }
-      overflow(details, items.length);
+      details.createEl("p", {
+        cls: "obsync-muted",
+        text:
+          "Only ticked files are pulled, and only when you press a pull button. " +
+          "Automatic pulls just refresh files already in your vault.",
+      });
+      this.renderTree(details, items, { id, st, manifest: m });
 
       const foot = details.createDiv({ cls: "obsync-actions" });
       const count = foot.createSpan({ cls: "obsync-muted obsync-count" });
       count.dataset.course = String(id);
       const go = foot.createEl("button", { text: "Pull selected", cls: "mod-cta" });
-      go.addEventListener("click", () => void this.pullCourse(id, st));
+      go.addEventListener("click", () => void this.pullCourse(st));
       this.updateCount(id);
     }
 
-    this.renderWithheld(details, p);
+    this.renderWithheld(details, id, p);
   }
 
-  private renderWithheld(parent: HTMLElement, p: Preview) {
-    const withheld = p.items.filter(
-      (i) => i.action !== "download" && i.action !== "update" && i.action !== "have",
-    );
+  private renderWithheld(parent: HTMLElement, id: number, p: Preview) {
+    const withheld = p.items.filter((i) => !isPullable(i) && i.action !== "have");
     if (withheld.length === 0) return;
 
     const details = parent.createEl("details", { cls: "obsync-withheld" });
+    details.open = this.openWithheld.has(id);
+    details.addEventListener("toggle", () => {
+      if (details.open) this.openWithheld.add(id);
+      else this.openWithheld.delete(id);
+    });
     details.createEl("summary", { text: `Not included (${withheld.length})` });
     details.createEl("p", {
       cls: "obsync-muted",
@@ -204,38 +239,141 @@ export class ObsyncView extends ItemView {
         "files were left for later by a scoped pull on the worker and arrive with " +
         "its next full pull.",
     });
-    const list = details.createDiv({ cls: "obsync-list" });
-    for (const item of withheld.slice(0, MAX_ROWS)) {
-      const row = list.createDiv({ cls: "obsync-row" });
-      row.createSpan({ cls: "obsync-tag", text: tagFor(item) });
-      const label = row.createDiv({ cls: "obsync-label" });
-      label.createSpan({ cls: "obsync-path", text: item.entry.path });
-      label.createSpan({ cls: "obsync-muted", text: ` ${item.reason}` });
+    this.renderTree(details, withheld);
+  }
+
+  /**
+   * Items as a collapsible folder tree.
+   *
+   * With `selection`, every file and folder gets a checkbox, plus one for the
+   * whole course. Ticking or unticking a folder applies to everything beneath
+   * it, and every box, files included, is redrawn from the selection so a
+   * parent and its children can never disagree. A folder shows a partial state
+   * when only some of it is ticked. Without `selection`, each file shows why it
+   * is withheld.
+   */
+  private renderTree(
+    parent: HTMLElement,
+    items: PreviewItem[],
+    selection?: { id: number; st: CourseState; manifest: Manifest },
+  ) {
+    const list = parent.createDiv({ cls: "obsync-list obsync-tree" });
+    const boxes: Box[] = [];
+
+    const redraw = () => {
+      if (!selection) return;
+      for (const { box, paths } of boxes) {
+        const n = paths.filter((path) => selection.st.selected.has(path)).length;
+        box.checked = n > 0 && n === paths.length;
+        box.indeterminate = n > 0 && n < paths.length;
+      }
+      this.updateCount(selection.id);
+    };
+    const select = (paths: string[], on: boolean) => {
+      if (!selection) return;
+      for (const path of paths) {
+        if (on) selection.st.selected.add(path);
+        else selection.st.selected.delete(path);
+      }
+      redraw();
+      // Remember the choice, so an untick holds through restarts and every
+      // automatic pull.
+      void this.syncer?.choose(selection.manifest, paths, on);
+    };
+    const checkbox = (row: HTMLElement, paths: string[]) => {
+      const box = row.createEl("input", { type: "checkbox" });
+      boxes.push({ box, paths });
+      box.addEventListener("change", () => select(paths, box.checked));
+    };
+
+    if (selection) {
+      const all = list.createDiv({ cls: "obsync-tree-row obsync-tree-all" });
+      all.createSpan({ cls: "obsync-tree-caret" });
+      checkbox(all, items.map((i) => i.entry.path));
+      all.createSpan({ cls: "obsync-tree-name", text: "All files" });
     }
-    overflow(details, withheld.length);
+
+    let rendered = 0;
+    const renderFolder = (el: HTMLElement, folder: TreeFolder<PreviewItem>, depth: number) => {
+      for (const sub of folder.folders) {
+        if (rendered >= MAX_ROWS) return;
+        const files = filesUnder(sub);
+        const node = el.createDiv({ cls: "obsync-tree-folder" });
+        const row = node.createDiv({ cls: "obsync-tree-row" });
+        const caret = row.createSpan({ cls: "obsync-tree-caret" });
+
+        if (selection) checkbox(row, files.map((f) => f.path));
+        setIcon(row.createSpan({ cls: "obsync-tree-icon" }), "folder");
+        const label = row.createDiv({ cls: "obsync-label obsync-tree-toggle" });
+        label.createSpan({ cls: "obsync-path obsync-tree-name", text: sub.name });
+        const bytes = files.reduce((n, f) => n + f.value.entry.size, 0);
+        label.createSpan({
+          cls: "obsync-muted",
+          text: ` ${files.length} ${files.length === 1 ? "file" : "files"}, ${humanBytes(bytes)}`,
+        });
+
+        const children = node.createDiv({ cls: "obsync-tree-children" });
+        let open = depth === 0 || files.length <= AUTO_EXPAND_FILES;
+        const apply = () => {
+          setIcon(caret, open ? "chevron-down" : "chevron-right");
+          children.toggle(open);
+          row.setAttr("aria-expanded", String(open));
+        };
+        const flip = () => {
+          open = !open;
+          apply();
+        };
+        caret.addEventListener("click", flip);
+        label.addEventListener("click", flip);
+        apply();
+
+        renderFolder(children, sub, depth + 1);
+      }
+
+      for (const file of folder.files) {
+        if (rendered >= MAX_ROWS) return;
+        rendered++;
+        const item = file.value;
+        const row = el.createDiv({ cls: "obsync-tree-row obsync-tree-file" });
+        // An empty caret keeps files aligned with their sibling folders.
+        row.createSpan({ cls: "obsync-tree-caret" });
+        if (selection) checkbox(row, [file.path]);
+        setIcon(row.createSpan({ cls: "obsync-tree-icon" }), "file");
+        const label = row.createDiv({ cls: "obsync-label" });
+        label.createSpan({ cls: "obsync-path", text: file.name });
+        label.createSpan({ cls: "obsync-muted", text: ` ${detailFor(item, selection !== undefined)}` });
+        const tag = tagFor(item);
+        if (tag) {
+          row.createSpan({ cls: `obsync-tag obsync-tag-${tag.kind}`, text: tag.text })
+            .setAttr("aria-label", tag.hint);
+        }
+      }
+    };
+
+    renderFolder(list, buildTree(items, (i) => i.entry.path), 0);
+    redraw();
+    overflow(parent, items.length);
   }
 
   private updateCount(id: number) {
     const st = this.courses.get(id);
     if (!st?.preview) return;
-    const bytes = pullable(st.preview)
-      .filter((i) => st.selected.has(i.entry.path))
+    const bytes = st.preview.items
+      .filter((i) => isPullable(i) && st.selected.has(i.entry.path))
       .reduce((n, i) => n + i.entry.size, 0);
     const el = this.containerEl.querySelector<HTMLElement>(
       `.obsync-count[data-course="${id}"]`,
     );
-    el?.setText(`${st.selected.size} selected, ${humanBytes(bytes)}`);
+    el?.setText(`${st.selected.size} ticked, ${humanBytes(bytes)}`);
   }
 
-  private async pullCourse(id: number, st: CourseState) {
-    const s = this.plugin.makeSyncer();
-    if (!s || !st.manifest || !st.preview) return;
-    // A full selection is a full pull: pass undefined so the run is marked
-    // complete and tombstones are processed. Passing the set would leave the
-    // course looking permanently unfinished.
-    const isAll = st.selected.size === pullable(st.preview).length;
+  private async pullCourse(st: CourseState) {
+    const s = this.syncer ?? this.plugin.makeSyncer();
+    if (!s || !st.manifest) return;
+    // The ticks are already saved with Syncer.choose, so a manual pull writes
+    // exactly what the panel shows as ticked.
     try {
-      notifyResult(await s.syncCourse(st.manifest, isAll ? undefined : st.selected));
+      notifyResult(await s.syncCourse(st.manifest, { mode: "manual" }));
     } catch (e) {
       new Notice(`obsync: ${String(e)}`);
     }
@@ -281,6 +419,10 @@ export class ObsyncView extends ItemView {
 
   private renderSetup(root: HTMLElement) {
     const details = root.createEl("details", { cls: "obsync-setup" });
+    details.open = this.setupOpen;
+    details.addEventListener("toggle", () => {
+      this.setupOpen = details.open;
+    });
     details.createEl("summary", { text: "Setup" });
     const box = details.createDiv();
     // The same form the settings tab renders, so the two cannot drift. It is
@@ -290,23 +432,33 @@ export class ObsyncView extends ItemView {
   }
 }
 
-const pullable = (p: Preview): PreviewItem[] =>
-  p.items.filter((i) => i.action === "download" || i.action === "update");
-
 function overflow(parent: HTMLElement, total: number) {
   if (total > MAX_ROWS) {
     parent.createEl("p", { cls: "obsync-muted", text: `... and ${total - MAX_ROWS} more.` });
   }
 }
 
-function tagFor(i: PreviewItem): string {
+/**
+ * The muted text beside a file. Pullable rows show size plus any worker note,
+ * since the tag already says new, changed or missing; withheld rows show why.
+ */
+function detailFor(item: PreviewItem, pullable: boolean): string {
+  if (!pullable) return item.reason;
+  const note = item.entry.reason ? ` · ${item.entry.reason}` : "";
+  return `${humanBytes(item.entry.size)}${note}`;
+}
+
+function tagFor(i: PreviewItem): { kind: string; text: string; hint: string } | null {
   switch (i.action) {
-    case "skip-local": return "your rules";
-    case "skip-worker": return "worker";
-    case "deferred": return "pending";
-    case "locked": return "locked";
-    case "unavailable": return "failed";
-    default: return "";
+    case "download": return { kind: "new", text: "new", hint: "Not in this vault yet" };
+    case "update": return { kind: "changed", text: "changed", hint: "Canvas has a newer version than the copy in this vault" };
+    case "restore": return { kind: "missing", text: "missing", hint: "Pulled before, then deleted from this vault. Tick it to put it back" };
+    case "skip-local": return { kind: "withheld", text: "your rules", hint: "Excluded by your local rules in Setup" };
+    case "skip-worker": return { kind: "withheld", text: "worker", hint: "Excluded by the worker's rules" };
+    case "deferred": return { kind: "withheld", text: "pending", hint: "Arrives with the worker's next full pull" };
+    case "locked": return { kind: "withheld", text: "locked", hint: "Not released in Canvas yet" };
+    case "unavailable": return { kind: "withheld", text: "failed", hint: "The worker could not fetch this file" };
+    default: return null;
   }
 }
 

@@ -27,9 +27,9 @@ Everything happens in the sidebar panel. Click the cloud icon in the left
 ribbon (or run **Open panel**) and it opens on the right:
 
 - **Status** and the two global actions, Pull now and Refresh.
-- **One section per course**: how much is pending, and a checklist of exactly
-  what will be written. Untick anything you do not want and press Pull
-  selected. Nothing is downloaded until you do.
+- **One section per course**: how much is new, changed or missing, and a folder
+  tree of exactly what will be written. Tick or untick files, folders or
+  **All files**, and press Pull selected. Nothing is downloaded until you do.
 - **Not included**, per course: everything Canvas has that was withheld, with
   the reason. A file you can see in Canvas that silently does not appear in
   your vault is the worst possible outcome, so nothing is hidden from you.
@@ -98,6 +98,32 @@ rule can never quietly cost you a file without saying so. Files tagged
 (`obsync-worker pull -path ...`) and arrive with its next full pull; there is
 nothing to change on your side.
 
+## Folders
+
+Each course gets its own folder under the target folder, named
+`code [term] (id)`, and so do its trash and conflicts:
+
+```
+Canvas/
+  CS3103 [2610] (93794)/Labs/labs-intro.pdf
+  CS2103-CS2103T [2510] (77826)/...   "/" in a cross-listed code becomes "-"
+  CP2106 (81917)/...                  no term tag in the Canvas name
+  _trash/CS3103 [2610] (93794)/...
+  _conflicts/CS3103 [2610] (93794)/...
+```
+
+The term is the tag the Canvas course name ends with. The id keeps two courses
+apart even when both have a `Labs/lab1.pdf`. If the name format changes, the
+folder is renamed on the next sync, not downloaded again.
+
+Obsidian's `[[wikilinks]]` cannot contain `[` or `]`, so link to these files
+with Markdown links (`[slides](<Canvas/CS3103 [2610] (93794)/Labs/x.pdf>)`)
+or embeds made through Obsidian's own link picker. Files pulled by an earlier version
+of the plugin, when every course shared one folder, are moved into their
+course's folder by the next sync: renamed, not downloaded again. A manifest
+from a worker too old to send the course code gives a folder named by id
+alone, and that folder is renamed once a newer worker publishes the code.
+
 ## A warning about search
 
 Dropping hundreds of PDFs into a vault triggers an Obsidian reindex. Keep the
@@ -108,6 +134,22 @@ links → Excluded files** if search gets noisy.
 
 On load (after a delay), on an interval, and manually from the panel. **Never on vault file
 change** — a mirror that reacts to your own edits is a feedback loop.
+
+**Nothing enters the vault unless it is ticked and you press a pull button.**
+
+| | Pull now / Pull selected | Automatic (startup, interval) |
+|---|---|---|
+| New file, ticked (the default) | pulled | not pulled |
+| File you unticked | not pulled | not pulled |
+| Changed in Canvas, already in the vault | pulled if ticked | refreshed unless unticked |
+| Deleted from the vault (starts unticked) | pulled only if you tick it | never |
+| Removed from Canvas | moved to trash | moved to trash |
+
+Ticks and unticks are remembered per device until the file is pulled, so an
+untick survives restarts. In the panel, each file is tagged **new** (not in
+this vault yet), **changed** (Canvas has a newer version than your copy) or
+**missing** (pulled before, then deleted from the vault). Unticking a folder,
+or **All files**, unticks everything beneath it.
 
 ## Development
 
