@@ -4,6 +4,7 @@ import { LocalState, loadState, saveState, emptyState } from "./state";
 import { RemoteStore } from "./store";
 import { Syncer, notifyResult } from "./sync";
 import { ObsyncView, VIEW_TYPE_OBSYNC } from "./ui/ObsyncView";
+import { widenRightSidebar } from "./ui/layout";
 
 export default class ObsyncPlugin extends Plugin {
   settings: ObsyncSettings = DEFAULT_SETTINGS;
@@ -53,6 +54,9 @@ export default class ObsyncPlugin extends Plugin {
     if (!leaf) {
       leaf = workspace.getRightLeaf(false);
       await leaf?.setViewState({ type: VIEW_TYPE_OBSYNC, active: true });
+      // Only when the panel is first created, so a sidebar the user resizes
+      // afterwards stays the size they chose.
+      widenRightSidebar(this.app);
     }
     if (leaf) await workspace.revealLeaf(leaf);
   }
