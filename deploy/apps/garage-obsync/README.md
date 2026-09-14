@@ -9,6 +9,33 @@ in order; only steps 1 and 5 end in a commit.
 
 ---
 
+## 0. Prerequisite: Longhorn drain policy
+
+Garage's volumes use `longhorn-garage` (`storageclass.yaml`): one Longhorn
+replica per volume, kept on the pod's own node, because Garage already stores
+three copies itself. Longhorn's default `node-drain-policy`,
+`block-if-contains-last-replica`, refuses to drain a node holding the only
+replica of any volume, which is every Garage node. kured would time out the
+drain after 20 minutes, release its lock, and retry forever.
+
+Set it to `allow-if-replica-is-stopped`: the drain waits until the Garage pod
+has been evicted and its volume detached, then proceeds. Volumes with three
+replicas are unaffected. Commit this as a file in `apps/longhorn-extras/`
+(`values-longhorn.yaml` deliberately sets no Longhorn settings):
+
+```yaml
+apiVersion: longhorn.io/v1beta2
+kind: Setting
+metadata:
+  name: node-drain-policy
+  namespace: longhorn-system
+value: "allow-if-replica-is-stopped"
+```
+
+```bash
+kubectl -n longhorn-system get settings.longhorn.io node-drain-policy -o jsonpath='{.value}'
+```
+
 ## 1. Seal the secrets (before the first sync)
 
 `kustomization.yaml` references `sealed-secret.yaml`, which is not committed
@@ -42,6 +69,17 @@ kubectl -n obsync get pods -w
 Expect three pods `Running` but `0/1 Ready`. That is correct at this point:
 readiness is `/health`, and `/health` is 503 until a layout exists.
 
+Check that every volume's single replica landed on its own pod's node. If one
+did not, the pod sits in `ContainerCreating`, because `strict-local` only lets
+a volume attach where its replica is:
+
+```bash
+kubectl -n obsync get pods -o custom-columns=POD:.metadata.name,NODE:.spec.nodeName
+kubectl -n longhorn-system get volumes.longhorn.io \
+  -o custom-columns=PVC:.status.kubernetesStatus.pvcName,NODE:.status.currentNodeID,REPLICAS:.spec.numberOfReplicas \
+  | grep -E 'PVC|garage'
+```
+
 ## 3. Connect the nodes (one time)
 
 Nothing discovers peers here: each pod starts knowing only itself, and
@@ -72,11 +110,11 @@ visibility into it and cannot recreate it.
 kubectl -n obsync get pods -o wide   # which node each garage-N landed on
 
 # One zone per node, named after the node the pod runs on: Garage places the 3
-# replicas in distinct zones. Capacity should be the real free space on that
-# node's disk, not the PVC size: local-path does not enforce the 100Gi request.
-kubectl -n obsync exec garage-0 -- /garage layout assign -z <node-of-garage-0> -c 90G <id-0>
-kubectl -n obsync exec garage-0 -- /garage layout assign -z <node-of-garage-1> -c 90G <id-1>
-kubectl -n obsync exec garage-0 -- /garage layout assign -z <node-of-garage-2> -c 90G <id-2>
+# replicas in distinct zones. Capacity a little under the 75Gi data volume,
+# which Longhorn enforces: 70G leaves room for the filesystem and Garage itself.
+kubectl -n obsync exec garage-0 -- /garage layout assign -z <node-of-garage-0> -c 70G <id-0>
+kubectl -n obsync exec garage-0 -- /garage layout assign -z <node-of-garage-1> -c 70G <id-1>
+kubectl -n obsync exec garage-0 -- /garage layout assign -z <node-of-garage-2> -c 70G <id-2>
 
 kubectl -n obsync exec garage-0 -- /garage layout show
 kubectl -n obsync exec garage-0 -- /garage layout apply --version 1
@@ -128,14 +166,20 @@ resolve, and nothing serves that zone.
 
 - **Quorum is 2 of 3.** kured's `concurrency: 1` already guarantees one node at
   a time, which this survives. Two nodes down means reads and writes fail.
-- **local-path pins pods to nodes.** A PVC binds to the node it was first
-  scheduled on; that pod can never move. Losing a node means losing that
-  replica until the node returns — Garage rebuilds from the other two, it does
-  not self-migrate.
-- **Resizing `data` later** requires
-  `kubectl delete statefulset garage -n obsync --cascade=orphan`, then editing
-  the template and re-syncing. PVCs and data survive; volumeClaimTemplates are
-  immutable in place and a naive sync fails with a forbidden-field error.
+- **strict-local pins pods to nodes.** Each data volume's only replica lives on
+  the node its pod first ran on, and it can attach nowhere else, so that pod
+  never moves: it waits out a reboot. Losing a node means losing that replica
+  until the node returns. Garage rebuilds from the other two; Longhorn does not
+  migrate anything.
+- **Growing `data`**: patch each PVC, and Longhorn expands it online.
+  `kubectl -n obsync patch pvc data-garage-0 -p '{"spec":{"resources":{"requests":{"storage":"100Gi"}}}}'`
+  (repeat for 1 and 2), then raise each node's `garage layout assign -c`. The
+  template size in `statefulset.yaml` only matters for PVCs created later;
+  applying a change there needs
+  `kubectl delete statefulset garage -n obsync --cascade=orphan` and a re-sync.
+- **No Longhorn backups for these volumes.** The store is a cache Canvas can
+  refill, and three 75Gi volumes over NFS is a lot of backup for no recovery
+  value. Do not add them to a recurring backup job.
 - **Config edits roll the pods.** `garage.toml` is a `configMapGenerator`, so a
   commit produces a new ConfigMap name and a rolling restart. That is deliberate
   (subPath mounts never pick up in-place ConfigMap changes).

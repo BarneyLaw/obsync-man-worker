@@ -40,18 +40,18 @@ spec:
                   app.kubernetes.io/instance: garage-obsync
               topologyKey: kubernetes.io/hostname
 
-        # Uncomment to constrain WHICH three nodes. Worth doing once you have
-        # decided where 100Gi of local-path actually fits: legion is the node
-        # you least want holding a replica (it is the transient one), and deus
-        # is the smallest disk. local-path does not enforce the size request —
-        # it is a hostPath directory, so an over-full node fills silently.
+        # Uncomment to constrain WHICH three nodes. Only nodes with Longhorn
+        # disk space can hold a data volume: sol has none, so a pod scheduled
+        # there never starts. legion is the node you least want holding a
+        # replica (it is the transient one). Longhorn enforces the 75Gi, so an
+        # over-full volume stops writes instead of filling the node's disk.
         # nodeAffinity:
         #   requiredDuringSchedulingIgnoredDuringExecution:
         #     nodeSelectorTerms:
         #       - matchExpressions:
         #           - key: kubernetes.io/hostname
         #             operator: In
-        #             values: ["nebula", "opus", "sol"]
+        #             values: ["deus", "nebula", "opus"]
 
       containers:
         - name: garage
@@ -115,16 +115,21 @@ spec:
             # kustomize rewrites this to the hash-suffixed generated name.
             name: garage-config
 
-  # volumeClaimTemplates are IMMUTABLE after creation. Resizing data later is
-  # `kubectl delete statefulset garage --cascade=orphan`, edit, re-sync — the
-  # PVCs and their contents survive. ArgoCD cannot prune these PVCs (it does
+  # volumeClaimTemplates are IMMUTABLE after creation. To grow a volume, patch
+  # the existing PVCs (longhorn-garage allows expansion); changing the size
+  # here only affects PVCs created later, and applying it needs
+  # `kubectl delete statefulset garage --cascade=orphan` then a re-sync. PVCs
+  # and their contents survive both. ArgoCD cannot prune these PVCs (it does
   # not own them), which is why prune: true is safe on this Application.
+  #
+  # Both on longhorn-garage (storageclass.yaml): one replica per volume on the
+  # pod's node, since Garage itself provides the replication.
   volumeClaimTemplates:
     - metadata:
         name: meta
       spec:
         accessModes: [ReadWriteOnce]
-        storageClassName: local-path
+        storageClassName: longhorn-garage
         resources:
           requests:
             storage: 5Gi
@@ -132,7 +137,7 @@ spec:
         name: data
       spec:
         accessModes: [ReadWriteOnce]
-        storageClassName: local-path
+        storageClassName: longhorn-garage
         resources:
           requests:
-            storage: 100Gi
+            storage: 75Gi
