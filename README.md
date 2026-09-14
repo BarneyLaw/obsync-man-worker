@@ -20,6 +20,7 @@ from there into an Obsidian vault. One-way. See [DESIGN.md](DESIGN.md).
 | plugin: types/policy/preview | done, contract-tested against the Go fixtures in `schema/` |
 | plugin: sync/store/UI | sync unit-tested against an in-memory adapter; untested in a real vault |
 | CI | `worker.yml` and `plugin.yml`, path-filtered, both on contract changes |
+| Deployment | `deploy/` bootstraps homelab-cicd-config: Garage StatefulSet and a CronJob daily at 18:17 SGT; see [deploy/README.md](deploy/README.md) |
 
 ## Worker commands
 
@@ -33,7 +34,7 @@ obsync-worker courses  # list active courses; -probe checks their files are reac
 
 ```sh
 # one course, everything
-obsync-worker pull -course CS3103 -rules deploy/rules.json -fs-store .obsync-store
+obsync-worker pull -course CS3103 -rules deploy/apps/obsync-worker/rules.json -fs-store .obsync-store
 
 # only some directories and files (paths as `obsync ls <course>` prints them)
 obsync-worker pull -course CS3103 -path "Week 1" -path "Tutorials/T3.pdf" ...
@@ -109,7 +110,7 @@ Get-Content .env | ForEach-Object {
   if ($_ -match '^\s*(?:export\s+)?(\w+)=(.*)$') { Set-Item "env:$($Matches[1])" $Matches[2].Trim('"', "'") }
 }
 go build -o bin/obsync-worker.exe ./cmd/obsync-worker; go build -o bin/obsync.exe ./cmd/obsync
-./bin/obsync-worker.exe pull -course CS3103 -rules deploy/rules.json -fs-store .obsync-store
+./bin/obsync-worker.exe pull -course CS3103 -rules deploy/apps/obsync-worker/rules.json -fs-store .obsync-store
 ./bin/obsync.exe serve
 ```
 
@@ -126,7 +127,7 @@ A single-node Garage in Docker for development, the same one CI uses:
 scripts/garage-dev.sh up             # container obsync-garage: bucket obsync, key obsync-dev
 eval "$(scripts/garage-dev.sh env)"
 make s3-test                         # Range GET, conformance, presign, a full worker pass
-./bin/obsync-worker pull -course CS3103 -path Labs -rules deploy/rules.json
+./bin/obsync-worker pull -course CS3103 -path Labs -rules deploy/apps/obsync-worker/rules.json
 ./bin/obsync ls
 ./bin/obsync serve                   # read-only proxy in front of Garage
 scripts/garage-dev.sh down           # removes the container and its data
@@ -203,7 +204,7 @@ CI is two workflows in `.github/workflows/`:
 
 | Workflow | Runs when these change | Does |
 |---|---|---|
-| `worker.yml` | `cmd/`, `internal/`, `go.mod`, `go.sum`, `deploy/rules.json` | tidy, gofmt, vet, race tests, fixture regeneration diff, build, cross-compile, smoke |
+| `worker.yml` | `cmd/`, `internal/`, `go.mod`, `go.sum`, `Dockerfile`, `deploy/`, the Garage and render scripts | tidy, gofmt, vet, race tests, fixture regeneration diff, build, cross-compile, smoke, manifest render, Garage S3 integration, image smoke; on `main`, publish the image and update homelab-cicd-config (see [deploy/README.md](deploy/README.md)) |
 | `plugin.yml` | `plugin/` (not Markdown) | `npm ci`, lint, tests, type-check and bundle on Node 22 and 24, release metadata, bundle artifact |
 | **both** | `schema/`, `internal/manifest`, `internal/policy`, `internal/plan`, `cmd/obsync`, and the plugin's `types`, `policy`, `preview`, `store`, `sync` and tests | cross-check each half against the same contract |
 
