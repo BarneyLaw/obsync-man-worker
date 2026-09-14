@@ -173,6 +173,43 @@ config:
 Path-style is not optional: vhost-style needs `<bucket>.s3.garage.internal` to
 resolve, and nothing serves that zone.
 
+## 7. Obsidian access
+
+The plugin reads the store at `https://obsync.lab.packetcraft.dev`. The route,
+`ingressroute.yaml`, goes through Traefik to Garage's web endpoint. That
+endpoint takes unsigned GETs and answers Range requests, so the plugin needs
+no credentials. Only `manifests/` and `blobs/` are routed. Three one-time steps:
+
+```bash
+# Garage chooses the bucket by Host header: allow website reads and give the
+# bucket an alias equal to the hostname.
+kubectl -n obsync exec garage-0 -- /garage bucket website --allow obsync
+kubectl -n obsync exec garage-0 -- /garage bucket alias obsync obsync.lab.packetcraft.dev
+```
+
+DNS is not managed by this repo. In Cloudflare, zone `packetcraft.dev`:
+
+| Type | Name | Content | Proxy |
+|---|---|---|---|
+| A | `obsync.lab` | `192.168.1.242` | DNS only |
+
+`192.168.1.242` is Traefik's ingress VIP, the address every `*.lab` record
+points at. It is private, so the name only works on the LAN or the tailnet.
+
+Check from a machine on the tailnet:
+
+```bash
+curl -s https://obsync.lab.packetcraft.dev/manifests/<course-id>/latest   # a run id
+curl -s -o /dev/null -w '%{http_code}\n' https://obsync.lab.packetcraft.dev/runs/   # 404
+```
+
+Then, in Obsidian, **obsync → Setup**: Store URL
+`https://obsync.lab.packetcraft.dev`, Bucket empty.
+
+A 404 on `latest` for a course the worker has pulled means the alias or the
+website flag is missing: `garage bucket info obsync` should show
+`Website access: true` and both global aliases.
+
 ---
 
 ## Operational notes
@@ -201,8 +238,10 @@ resolve, and nothing serves that zone.
 - **Config edits roll the pods.** `garage.toml` is a `configMapGenerator`, so a
   commit produces a new ConfigMap name and a rolling restart. That is deliberate
   (subPath mounts never pick up in-place ConfigMap changes).
-- **No IngressRoute.** The S3 and admin ports are cluster-internal. If obsync
-  clients outside the cluster ever need the endpoint, that is a Traefik
-  IngressRoute plus a decision about exposing S3 auth over the tunnel.
+- **Only reads leave the cluster.** The IngressRoute exposes the web endpoint's
+  `manifests/` and `blobs/` on `*.lab`, which means the LAN and the tailnet, never
+  the public tunnel. The S3 API (writes, signed) and admin stay
+  cluster-internal. Read access is unauthenticated: anyone on the tailnet can
+  fetch course files.
 - **No NetworkPolicy yet.** Worth adding once the obsync backend exists, so only
   it can reach port 3900 and nothing can reach 3903.

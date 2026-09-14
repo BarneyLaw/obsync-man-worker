@@ -12,6 +12,7 @@ resources:
   - storageclass.yaml       # cluster-scoped; the namespace transformer skips it
   - statefulset.yaml
   - service.yaml
+  - ingressroute.yaml       # Obsidian's read path, README step 7
   - servicemonitor.yaml
 
 # garage.toml is a generator, not a committed ConfigMap, specifically because
